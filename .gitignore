@@ -1,0 +1,20 @@
+# data and derived outputs — never commit
+results/
+runs/
+data/
+test_files/
+*.pt
+*.pth
+*.png
+*.csv
+*.json
+*.log
+
+# cached caches
+*_cache/
+
+# python
+__pycache__/
+*.pyc
+env/
+.venv/

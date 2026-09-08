@@ -1,0 +1,1 @@
+python run_server.py --run-config 'lr=0.001    trial-tag="090726_test"'

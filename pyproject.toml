@@ -1,0 +1,61 @@
+[build-system]
+requires=["hatchling"]
+build-backend="hatchling.build"
+
+[project]
+name="hereditary-ms"
+version="0.1.0"
+description="Federated OCT MS diagnosis"
+dependencies=[
+    "numpy==2.4.6",
+    "torch==2.14.0",
+    "torchvision==0.29.0",
+    "tensorboard==2.20.0",
+    "Pillow==12.3.0",
+    "pandas==3.0.5",
+    "tqdm==4.70.0",
+    "scipy==1.17.1",
+    "scikit-learn==1.9.0",
+    "matplotlib==3.11.1",
+    "seaborn==0.13.2"
+]
+
+[tool.hatch.build.targets.wheel]
+packages=["."]
+
+[tool.hatch.build]
+include=[
+    "*.py",
+    "pyproject.toml",
+]
+exclude=[
+    "debug_logs/**",
+    "results/**",
+    "runs/**",
+    "data/**",
+    "*.pth",
+    "*.png",
+]
+
+[tool.fl.server]
+host = "0.0.0.0"
+port = 9092
+round-timeout-s = 7200
+heartbeat-timeout-s = 60
+
+[tool.fl.sites.ucd]
+display-name = "University of Denver"
+token = "replace-me-ucd"
+
+[tool.fl.sites.unipd]
+display-name = "University of Padova"
+token = "replace-me-unipd"
+
+[tool.fl.config]
+num-server-rounds = 5
+min-nodes = 2
+lr = 0.0005
+weight-decay = 0.005
+local-epochs = 5
+batch-size = 16
+trial-tag = "lr_5e4"

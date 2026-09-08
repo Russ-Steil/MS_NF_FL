@@ -1,0 +1,1 @@
+python run_server.py --run-config "trial-tag='20260908_run1' lr=0.0005 batch-size=4"
