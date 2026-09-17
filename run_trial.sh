@@ -1,1 +1,1 @@
-python run_server.py --run-config 'lr=0.001 trial-tag="090726_test" n-ms-subjects=184 n-ctrl-subjects=46'
+python run_server.py --run-config 'batch-size=4 lr=0.001 trial-tag="090726_test" n-ms-subjects=184 n-ctrl-subjects=46'
