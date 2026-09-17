@@ -1,0 +1,8 @@
+=== Nodo di esecuzione ===
+brain01
+=== Versione GLIBC ===
+ldd (Ubuntu GLIBC 2.27-3ubuntu1.6) 2.27
+=== Controllo gRPC ===
+gRPC versione: 1.83.1
+=== Controllo PyTorch e CUDA ===
+Torch: 2.5.1+cu124 | CUDA disponibile: True

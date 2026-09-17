@@ -1,0 +1,19 @@
+[client:unipd] torch=2.5.1+cu124 numpy=2.4.6 python=3.11.9 host=brain02
+CLIENT ABORTED at 2026-09-09 21:44:01
+  site=unipd trial=trial5_1e3_2e_10r phase=startup round=0
+  pid=45391 ppid=45384
+  RuntimeError: POST /join failed after 3 attempts: <urlopen error [Errno 111] Connection refused>
+Traceback (most recent call last):
+  File "/home/bovo/MS_NF_FL/fl_client.py", line 433, in main
+    info = transport.join()
+           ^^^^^^^^^^^^^^^^
+  File "/home/bovo/MS_NF_FL/fl_client.py", line 186, in join
+    return self._request("POST", "/join", body=b"")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bovo/MS_NF_FL/fl_client.py", line 183, in _request
+    raise RuntimeError(f"{method} {path} failed after {HTTP_RETRIES} attempts: {last}")
+RuntimeError: POST /join failed after 3 attempts: <urlopen error [Errno 111] Connection refused>
+
+[client:unipd] failure written to /home/bovo/MS_NF_FL/runs/fl_clients/unipd/trial5_1e3_2e_10r/failure.log
+[client:unipd] gpu at failure free=14.98GiB total=15.77GiB
+[client:unipd] could not notify server: POST /abort failed after 3 attempts: <urlopen error [Errno 111] Connection refused>

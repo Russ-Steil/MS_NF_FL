@@ -1,0 +1,26 @@
+#!/bin/bash
+#SBATCH --partition=brains
+#SBATCH -w brain01
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=8G
+#SBATCH --time=00:10:00
+#SBATCH --job-name=check_env
+#SBATCH --output=check_env_%j.out
+#SBATCH --error=check_env_%j.err
+
+# 1. Carica l'ambiente conda
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate flwr_ms
+
+# 2. Comandi di verifica
+echo "=== Nodo di esecuzione ==="
+hostname
+
+echo "=== Versione GLIBC ==="
+ldd --version | head -n 1
+
+echo "=== Controllo gRPC ==="
+python -c "import grpc; print('gRPC versione:', grpc.__version__)"
+
+echo "=== Controllo PyTorch e CUDA ==="
+python -c "import torch; print('Torch:', torch.__version__, '| CUDA disponibile:', torch.cuda.is_available())"

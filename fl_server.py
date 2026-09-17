@@ -877,6 +877,9 @@ def main():
     local_epochs = int(rc["local-epochs"])
     batch_size   = int(rc["batch-size"])
     trial_tag    = str(rc["trial-tag"])
+    n_ms_subjects = int(rc.get("n-ms-subjects", rc.get("n_ms_subjects", 184))) 
+    n_ctrl_subjects = int(rc.get("n-ctrl-subjects", rc.get("n_ctrl_subjects", 46)))
+    log(f"dynamic sampling: {n_ms_subjects} MS subjects, {n_ctrl_subjects} CTRL subjects per round")
 
     host = args.host or server_cfg.get("host", DEFAULT_HOST)
     port = int(args.port or server_cfg.get("port", DEFAULT_PORT))
@@ -932,6 +935,8 @@ def main():
             "weight_decay": weight_decay,
             "epochs": local_epochs,
             "batch_size": batch_size,
+            "n_ms_subjects": n_ms_subjects,
+            "n_ctrl_subjects": n_ctrl_subjects,
         }
 
     def eval_config(server_round: int):
@@ -974,3 +979,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

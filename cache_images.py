@@ -36,7 +36,7 @@ from PIL import Image
 
 IMG_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
 SPLITS = ("train", "val")
-CROP_LEFT = 400
+CROP_LEFT = 500
 
 
 def build_task_list(src_root, dst_root, splits):
