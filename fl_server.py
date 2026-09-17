@@ -19,7 +19,8 @@ than min-nodes, aborts the whole run. The reason names the site and is written
 to failure.log and final_metrics.json before the process exits non-zero.
 
 Endpoints (all require Authorization: Bearer <site token>):
-    POST /join       register, returns run identity
+    POST /join       register, optional X-FL-Meta {train_class_counts};
+                     returns run identity
     GET  /status     phase, round, config for this round, submitted flag
     GET  /params     current global weights as npz
     POST /fit        npz body + X-FL-Meta {round, num_examples, metrics}
@@ -63,8 +64,8 @@ from model import get_resnet50_binary
 from train import plot_auc_curves, plot_loss_curves
 
 # ---- config ----
-RESULTS_ROOT = Path("/data/giacomo/Hereditary_MS/noflower_FL/results")
-TB_ROOT = Path("/data/giacomo/Hereditary_MS/noflower_FL/runs/fl_server")
+RESULTS_ROOT = Path("/data/russ/MS_NF_FL/results")
+TB_ROOT = Path("/data/russ/MS_NF_FL/runs/fl_server")
 POS_LABEL_NAME = "MS"
 NEG_LABEL_NAME = "CTRL"
 DEFAULT_ROUND_TIMEOUT_S = 7200.0
@@ -117,6 +118,26 @@ def weighted_scalar(pairs, key):
 
 def fmt(x, nd=4):
     return f"{x:.{nd}f}" if x == x else "nan"
+
+
+def train_cap_from_counts(site_counts, participants, registry):
+    """
+    The per-class train draw every site shares: the smallest minority-class
+    count across participants. The site that sets it trains on everything it
+    would have anyway; larger sites downsample to match, redrawing each epoch.
+
+    Returns (cap, {site: its own minority count}), or (None, reason) if some
+    participant never reported.
+    """
+    per_site = {}
+    for sid in sorted(participants):
+        counts = site_counts.get(sid)
+        if not counts:
+            return None, f"{registry.name(sid)} reported no train class counts"
+        per_site[sid] = min(counts.values())
+    if not per_site:
+        return None, "no participants reported train class counts"
+    return min(per_site.values()), per_site
 
 
 # ---------------------------------------------------------------- config
@@ -263,6 +284,7 @@ class Run:
 
         self.fit_results = {}           # site -> (n, params, metrics)
         self.eval_results = {}          # site -> (loss, n, metrics)
+        self.site_counts = {}           # site -> {class index: train count}
         self.participants = set()
         self.abort_reasons = None
 
@@ -398,6 +420,18 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if path == "/join":
+                # tolerated when absent: a client that predates the train cap
+                # still joins, it just leaves the run uncapped
+                raw = self.headers.get(META_HEADER)
+                counts = (json.loads(raw) if raw else {}).get("train_class_counts")
+                if counts:
+                    counts = {int(k): int(v) for k, v in counts.items()}
+                    with run.cv:
+                        run.site_counts[site] = counts
+                    log(f"{run.registry.name(site)} reports train class counts {counts}")
+                else:
+                    log(f"{run.registry.name(site)} joined without train class counts")
+
                 self._json(200, {
                     "site_id": site,
                     "display_name": run.registry.name(site),
@@ -925,6 +959,10 @@ def main():
 
     orch = Orchestrator(run, agg, registry, min_nodes, round_timeout)
 
+    # filled in once every participant has joined and reported its class counts;
+    # eval reads it too so the client builds a single set of loaders
+    caps = {"train_per_class": None}
+
     def fit_config(server_round: int):
         return {
             "server_round": server_round,
@@ -932,13 +970,34 @@ def main():
             "weight_decay": weight_decay,
             "epochs": local_epochs,
             "batch_size": batch_size,
+            "max_per_class_train": caps["train_per_class"],
         }
 
     def eval_config(server_round: int):
-        return {"server_round": server_round, "batch_size": batch_size}
+        return {
+            "server_round": server_round,
+            "batch_size": batch_size,
+            "max_per_class_train": caps["train_per_class"],
+        }
+
+    def resolve_train_cap():
+        with run.cv:
+            counts = dict(run.site_counts)
+            participants = set(run.participants)
+        cap, detail = train_cap_from_counts(counts, participants, registry)
+        if cap is None:
+            event(f"no common train cap: {detail} — each site will fall back to "
+                  f"balancing against its own minority class", RED)
+            return
+        caps["train_per_class"] = cap
+        for sid, own in sorted(detail.items()):
+            log(f"  {registry.name(sid)}: minority class has {own} images")
+        event(f"train cap set to {cap} images per class "
+              f"({2 * cap} per epoch at every site)", CYAN)
 
     try:
         orch.wait_for_participants()
+        resolve_train_cap()
         orch.run_rounds(fit_config, eval_config)
     except RunAborted as exc:
         run.finish("aborted")

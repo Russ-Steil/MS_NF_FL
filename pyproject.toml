@@ -52,10 +52,10 @@ display-name = "University of Padova"
 token = "replace-me-unipd"
 
 [tool.fl.config]
-num-server-rounds = 5
+num-server-rounds = 60
 min-nodes = 2
 lr = 0.0005
-weight-decay = 0.005
-local-epochs = 5
+weight-decay = 0.0001
+local-epochs = 10
 batch-size = 16
-trial-tag = "lr_5e4"
+trial-tag = "trial7_1e5_10e_30r"

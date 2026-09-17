@@ -84,8 +84,8 @@ def write_failure(dataset_name, trial_tag, phase, server_round, exc):
     return detail
 
 
-def get_dataloaders(dataset_name, data_path, batch_size=4, image_size=512,
-                    cache_path=None):
+def build_datasets(dataset_name, data_path, image_size=512, cache_path=None):
+    """Construct the train/val datasets once. Returns (train_ds, val_ds, workers)."""
     if cache_path:
         manifest = read_cache_manifest(cache_path)
 
@@ -104,7 +104,7 @@ def get_dataloaders(dataset_name, data_path, batch_size=4, image_size=512,
         train_dir = os.path.join(cache_path, "train")
         val_dir = os.path.join(cache_path, "val")
         print(f"[client:{dataset_name}] cached train={train_dir} val={val_dir} "
-              f"bs={batch_size} (built {manifest['created_at']})")
+              f"(built {manifest['created_at']})")
 
         train_ds = CachedOCTDataset(train_dir, transform=get_cached_train_transform())
         val_ds = CachedOCTDataset(val_dir, transform=get_cached_val_transform())
@@ -120,7 +120,7 @@ def get_dataloaders(dataset_name, data_path, batch_size=4, image_size=512,
         train_dir = os.path.join(data_path, "train")
         val_dir = os.path.join(data_path, "val")
         print(
-            f"[client:{dataset_name}] train={train_dir} val={val_dir} bs={batch_size} crop={crop}"
+            f"[client:{dataset_name}] train={train_dir} val={val_dir} crop={crop}"
         )
 
         train_ds = cls(
@@ -132,7 +132,16 @@ def get_dataloaders(dataset_name, data_path, batch_size=4, image_size=512,
         )
         num_workers = 4
 
-    sampler = build_downsampler(np.array(train_ds.targets))
+    return train_ds, val_ds, num_workers
+
+
+def build_loaders(train_ds, val_ds, num_workers, batch_size, max_per_class=None):
+    """
+    Train is drawn through the balanced downsampler, capped at max_per_class
+    images per class so every site trains on the same number of images per
+    epoch. The subset is redrawn on each epoch. Val is left whole.
+    """
+    sampler = build_downsampler(np.array(train_ds.targets), per_class=max_per_class)
     trainloader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, sampler=sampler,
         num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0
@@ -143,6 +152,17 @@ def get_dataloaders(dataset_name, data_path, batch_size=4, image_size=512,
     )
 
     num_examples = {"trainset": len(sampler), "testset": len(val_ds)}
+    return trainloader, testloader, num_examples, sampler
+
+
+def get_dataloaders(dataset_name, data_path, batch_size=4, image_size=512,
+                    cache_path=None, max_per_class=None):
+    train_ds, val_ds, num_workers = build_datasets(
+        dataset_name, data_path, image_size=image_size, cache_path=cache_path
+    )
+    trainloader, testloader, num_examples, _ = build_loaders(
+        train_ds, val_ds, num_workers, batch_size, max_per_class=max_per_class
+    )
     return trainloader, testloader, num_examples
 
 
@@ -182,8 +202,9 @@ class Transport:
                     time.sleep(HTTP_BACKOFF_S * attempt)
         raise RuntimeError(f"{method} {path} failed after {HTTP_RETRIES} attempts: {last}")
 
-    def join(self):
-        return self._request("POST", "/join", body=b"")
+    def join(self, train_class_counts):
+        meta = {"train_class_counts": train_class_counts}
+        return self._request("POST", "/join", body=b"", meta=meta)
 
     def status(self):
         return self._request("GET", "/status")
@@ -207,6 +228,12 @@ class Transport:
 
 # ---------------------------------------------------------------- client
 
+def _cap_from(config):
+    """The server's per-class train cap, or None when it could not compute one."""
+    cap = config.get("max_per_class_train")
+    return None if cap is None else int(cap)
+
+
 class OCTClient:
 
     def __init__(self, model, dataset_name, data_path, trial_tag, device,
@@ -225,13 +252,29 @@ class OCTClient:
         log_dir = os.path.join("runs", "fl_clients", self.dataset_name, trial_tag)
         self.writer = SummaryWriter(log_dir=log_dir)
 
-    def _loaders(self, batch_size):
-        if batch_size not in self._cache:
-            self._cache[batch_size] = get_dataloaders(
-                self.dataset_name, self.data_path, batch_size=batch_size,
-                cache_path=self.cache_path
+        # built once: the server needs the class counts before the first round
+        self.train_ds, self.val_ds, self.num_workers = build_datasets(
+            dataset_name, data_path, cache_path=cache_path
+        )
+
+    def train_class_counts(self):
+        """{class index: count} over the train split, reported to the server."""
+        classes, counts = np.unique(np.array(self.train_ds.targets), return_counts=True)
+        return {int(c): int(n) for c, n in zip(classes, counts)}
+
+    def _loaders(self, batch_size, max_per_class):
+        key = (batch_size, max_per_class)
+        if key not in self._cache:
+            loaders = build_loaders(
+                self.train_ds, self.val_ds, self.num_workers, batch_size,
+                max_per_class=max_per_class
             )
-        return self._cache[batch_size]
+            sampler = loaders[3]
+            print(f"[client:{self.dataset_name}] train draw "
+                  f"{sampler.per_class}/class -> {len(sampler)} images per epoch "
+                  f"(cap from server: {max_per_class}), val {len(self.val_ds)} images")
+            self._cache[key] = loaders
+        return self._cache[key][:3]
 
     def _release(self):
         """Drop dead references and return cached blocks to the CUDA allocator."""
@@ -272,6 +315,7 @@ class OCTClient:
         weight_decay = float(config["weight_decay"])
         epochs = int(config["epochs"])
         batch_size = int(config["batch_size"])
+        max_per_class = _cap_from(config)
 
         print(
             f"[client:{self.dataset_name}] round {rnd} "
@@ -282,7 +326,7 @@ class OCTClient:
             torch.cuda.reset_peak_memory_stats(self.device)
         self._log_gpu(f"round {rnd} fit-start")
 
-        trainloader, _, num_examples = self._loaders(batch_size)
+        trainloader, _, num_examples = self._loaders(batch_size, max_per_class)
         try:
             train(
                 self.model,
@@ -332,7 +376,7 @@ class OCTClient:
 
     def evaluate(self, rnd, config):
         batch_size = int(config.get("batch_size", 4))
-        _, testloader, num_examples = self._loaders(batch_size)
+        _, testloader, num_examples = self._loaders(batch_size, _cap_from(config))
 
         self._log_gpu(f"round {rnd} eval-start")
 
@@ -430,11 +474,6 @@ def main():
     phase, rnd = "startup", 0
 
     try:
-        info = transport.join()
-        display = info.get("display_name", dataset_name)
-        print(paint(f"[client:{dataset_name}] joined as {display} at {now_hms()} "
-                    f"({info.get('num_rounds')} rounds)", GREEN), flush=True)
-
         if torch.cuda.is_available():
             n_gpus = torch.cuda.device_count()
             if args.gpu_index >= n_gpus:
@@ -456,6 +495,15 @@ def main():
         model = get_resnet50_binary().to(device)
         client = OCTClient(model, dataset_name, args.data_path, trial_tag, device,
                            cache_path=args.cache_path)
+
+        # the server needs every site's class counts to pick a common per-class
+        # train cap, so they go out with the join
+        counts = client.train_class_counts()
+        info = transport.join(counts)
+        display = info.get("display_name", dataset_name)
+        print(paint(f"[client:{dataset_name}] joined as {display} at {now_hms()} "
+                    f"({info.get('num_rounds')} rounds), train counts {counts}",
+                    GREEN), flush=True)
 
         hb = Heartbeat(transport, dataset_name)
         hb.start()

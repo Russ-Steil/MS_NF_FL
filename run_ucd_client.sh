@@ -4,5 +4,5 @@ FL_TOKEN=replace-me-ucd python fl_client.py \
   --data-path /data/giacomo/Hereditary_MS/data/MS_cohort_non_MS_ctrls \
   --cache-path /data/giacomo/Hereditary_MS/data/MS_cohort_non_MS_ctrls/cache/ucd_512 \
   --server http://127.0.0.1:9092 \
-  --trial-tag 090726_test \
+  --trial-tag trial9_1e5_10e_60r \
   --gpu-index 0
