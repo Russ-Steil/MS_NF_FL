@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Federated server for the ResNet50 MS classifier. No flwr.
+Federated server for the MS classifier. No flwr.
+
+The backbone (resnet or retfound) comes from the run-config and is handed to
+every client at /join along with the reference state_dict layout, so all three
+processes build the same model.
 
 Architecture: a single HTTP port. Clients pull the global weights, train
 locally, and push weights plus scalar metrics back. Nothing inbound is needed
@@ -20,7 +24,8 @@ to failure.log and final_metrics.json before the process exits non-zero.
 
 Endpoints (all require Authorization: Bearer <site token>):
     POST /join       register, optional X-FL-Meta {train_class_counts};
-                     returns run identity
+                     returns run identity, the model spec and the reference
+                     manifest
     GET  /status     phase, round, config for this round, submitted flag
     GET  /params     current global weights as npz
     POST /fit        npz body + X-FL-Meta {round, num_examples, metrics}
@@ -56,11 +61,12 @@ except ModuleNotFoundError:  # python < 3.11
     import tomli as tomllib
 
 from fl_common import (
-    BOLD, CYAN, DIM, GREEN, MAX_BODY_BYTES, META_HEADER, RED, RESET, YELLOW,
-    deserialize_params, fedavg, manifest_of, now_hms, now_iso, paint,
+    BOLD, CYAN, DIM, GREEN, MAX_BODY_BYTES, META_HEADER, RED, RESET, WIRE_VERSION,
+    YELLOW, deserialize_params, fedavg, manifest_of, now_hms, now_iso, paint,
     serialize_params,
 )
-from model import get_resnet50_binary
+from model import (BACKBONES, RETFOUND_INPUT_HW, build_model,
+                   encoder_fingerprint)
 from train import plot_auc_curves, plot_loss_curves
 
 # ---- config ----
@@ -153,6 +159,25 @@ def parse_run_overrides(text):
         k, v = tok.split("=", 1)
         out[k.strip()] = v.strip().strip("'\"")
     return out
+
+
+def as_bool(value, key):
+    """Coerce a run-config value to bool.
+
+    Overrides arrive from --run-config as strings, so bool("false") is True and
+    a flag typed on the command line would do the opposite of what it says.
+    Values read straight from pyproject.toml are already real bools.
+    """
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off"):
+        return False
+    raise SystemExit(
+        f"run-config '{key}' must be a boolean (true/false), got {value!r}"
+    )
 
 
 def load_config(pyproject_path, overrides_text):
@@ -269,11 +294,14 @@ class SiteRegistry:
 class Run:
     """Shared state between the HTTP handlers and the orchestrator thread."""
 
-    def __init__(self, registry, reference_params, num_rounds):
+    def __init__(self, registry, reference_params, num_rounds, model_spec=None):
         self.registry = registry
         self.reference = reference_params
         self.manifest = manifest_of(reference_params)
         self.num_rounds = int(num_rounds)
+        # describes the architecture the clients must build to match the
+        # reference state_dict; handed out at /join
+        self.model_spec = dict(model_spec or {})
 
         self.cv = threading.Condition()
         self.phase = "waiting"          # waiting | fit | evaluate | done | aborted
@@ -291,9 +319,12 @@ class Run:
     # -- mutation helpers, all under the condition --
 
     def set_params(self, params):
+        # Serialize outside the lock: at ViT-L size this takes ~1s, and holding
+        # cv through it stalls every /status heartbeat in flight.
+        blob = serialize_params(params)
         with self.cv:
             self.global_params = params
-            self.params_blob = serialize_params(params)
+            self.params_blob = blob
 
     def begin_phase(self, phase, server_round, config):
         with self.cv:
@@ -402,14 +433,21 @@ class Handler(BaseHTTPRequestHandler):
         if site is None:
             return
 
-        if path == "/status":
-            self._json(200, run.snapshot(site))
-        elif path == "/params":
-            with run.cv:
-                blob = run.params_blob
-            self._binary(200, blob)
-        else:
-            self._json(404, {"error": f"no such endpoint: {path}"})
+        try:
+            if path == "/status":
+                self._json(200, run.snapshot(site))
+            elif path == "/params":
+                with run.cv:
+                    blob = run.params_blob
+                self._binary(200, blob)
+            else:
+                self._json(404, {"error": f"no such endpoint: {path}"})
+        except Exception as exc:
+            # A client that drops mid-transfer raises BrokenPipeError here. At
+            # ViT-L size that is a 1.2 GB window, so log it rather than letting
+            # the handler dump a traceback to stderr.
+            log(f"{run.registry.name(site)} GET {path} failed: "
+                f"{type(exc).__name__}: {exc}")
 
     def do_POST(self):
         run = self.RUN
@@ -432,16 +470,32 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     log(f"{run.registry.name(site)} joined without train class counts")
 
-                self._json(200, {
+                payload = {
                     "site_id": site,
                     "display_name": run.registry.name(site),
                     "num_rounds": run.num_rounds,
-                })
+                    "wire_version": WIRE_VERSION,
+                    # the client builds its model from this, so both sides end
+                    # up with byte-identical state_dict key order
+                    "manifest": run.manifest,
+                }
+                payload.update(run.model_spec)
+                self._json(200, payload)
 
             elif path == "/fit":
                 meta = self._meta()
                 blob = self._body()
+                # Check the round before deserializing: a stale submission would
+                # otherwise cost a full ViT-L decode (~1s, ~3.6 GB) to be thrown
+                # away.
+                with run.cv:
+                    stale = int(meta["round"]) != run.round or run.phase != "fit"
+                if stale:
+                    self._json(409, {"error": "stale round or phase"})
+                    return
+
                 params = deserialize_params(blob, expect=run.manifest)
+                del blob
                 with run.cv:
                     if int(meta["round"]) != run.round or run.phase != "fit":
                         self._json(409, {"error": "stale round or phase"})
@@ -626,13 +680,15 @@ class Aggregator:
             log(f"    [{site:<8}] n={r['n']:<6} loss={fmt(r['loss'])} "
                 f"acc={fmt(r['acc'])} auc={fmt(r['auc'])}")
 
+        # Save the aggregate directly. Building a throwaway model just to round
+        # trip through load_state_dict validated nothing that deserialize_params
+        # had not already checked against run.manifest, and at ViT-L size it cost
+        # a 1.2 GB allocation every round.
         state_dict = OrderedDict(
             (k, torch.as_tensor(np.array(v))) for k, v in agg.items()
         )
-        model = get_resnet50_binary(pretrained=False)
-        model.load_state_dict(state_dict, strict=True)
-        torch.save(model.state_dict(), self.output_dir / "model_federated_final.pth")
-        self._last_state_dict = model.state_dict()
+        torch.save(state_dict, self.output_dir / "model_federated_final.pth")
+        self._last_state_dict = state_dict
 
         return agg
 
@@ -873,6 +929,14 @@ class Orchestrator:
                     f"returned a result for round {rnd} fit"
                 ])
             new_params = self.agg.aggregate_fit(rnd, results, self.run.reference)
+
+            # Drop the per-site weight copies before evaluate starts. They are
+            # ~1.2 GB each for the ViT and were otherwise pinned for the whole
+            # evaluate phase.
+            del results, raw
+            with self.run.cv:
+                self.run.fit_results = {}
+
             self.run.set_params(new_params)
 
             self.agg.start_evaluate(rnd)
@@ -903,6 +967,8 @@ def main():
     args = ap.parse_args()
 
     rc, server_cfg, sites_cfg = load_config(args.pyproject, args.run_config)
+    # what the caller typed, as opposed to what pyproject.toml defaults to
+    explicit = set(parse_run_overrides(args.run_config))
 
     num_rounds   = int(rc["num-server-rounds"])
     min_nodes    = int(rc["min-nodes"])
@@ -911,6 +977,45 @@ def main():
     local_epochs = int(rc["local-epochs"])
     batch_size   = int(rc["batch-size"])
     trial_tag    = str(rc["trial-tag"])
+
+    backbone = str(rc.get("backbone", "resnet")).strip().lower()
+    if backbone not in BACKBONES:
+        raise SystemExit(
+            f"run-config 'backbone' must be one of {list(BACKBONES)}, got {backbone!r}"
+        )
+
+    retfound_weights = str(rc.get("retfound-weights", "")).strip()
+    retfound_finetune = as_bool(rc.get("retfound-finetune", True), "retfound-finetune")
+    retfound_layer_decay = float(rc.get("retfound-layer-decay", 0.75))
+    # SGD and AdamW live on different LR scales, and layer decay divides the
+    # early layers by 0.75^25 on top of that, so retfound cannot reuse `lr`.
+    retfound_lr = float(rc.get("retfound-lr", 1e-3))
+    retfound_wd = float(rc.get("retfound-weight-decay", 0.05))
+
+    if backbone == "retfound":
+        # Clients are overwritten with the server's global weights before their
+        # first gradient step, so the server's copy is the only one that seeds
+        # the federation. Without it every site would train a random-init ViT-L
+        # and nothing would say so.
+        if not retfound_weights:
+            raise SystemExit(
+                "backbone=retfound requires 'retfound-weights' in the run-config "
+                "— the server's checkpoint is what seeds every site."
+            )
+        if not os.path.isfile(retfound_weights):
+            raise SystemExit(
+                f"retfound-weights does not exist: {retfound_weights}"
+            )
+        # lr/weight-decay are the SGD numbers for the resnet. Refuse rather than
+        # silently ignore them, so nobody sets lr= and wonders why it did nothing.
+        ignored = sorted({"lr", "weight-decay"} & explicit)
+        if ignored:
+            raise SystemExit(
+                f"backbone=retfound ignores {ignored} — those are the resnet's SGD "
+                f"settings. Use retfound-lr / retfound-weight-decay instead."
+            )
+        # the client-side optimizer settings travel in fit_config
+        lr, weight_decay = retfound_lr, retfound_wd
 
     host = args.host or server_cfg.get("host", DEFAULT_HOST)
     port = int(args.port or server_cfg.get("port", DEFAULT_PORT))
@@ -930,8 +1035,13 @@ def main():
     log(f"python {platform.python_version()}")
     log(f"host   {platform.node()}")
     log("=" * 60)
-    log(f"trial={trial_tag} lr={lr} wd={weight_decay} epochs={local_epochs} "
-        f"bs={batch_size} rounds={num_rounds} min_nodes={min_nodes}")
+    log(f"trial={trial_tag} backbone={backbone} lr={lr} wd={weight_decay} "
+        f"epochs={local_epochs} bs={batch_size} rounds={num_rounds} "
+        f"min_nodes={min_nodes}")
+    if backbone == "retfound":
+        log(f"retfound weights={retfound_weights} finetune={retfound_finetune} "
+            f"layer_decay={retfound_layer_decay} "
+            f"input={RETFOUND_INPUT_HW[0]}x{RETFOUND_INPUT_HW[1]}")
     log(f"results  -> {output_dir}")
     log(f"tensorboard -> {tb_dir}")
     log(f"round_timeout={round_timeout}s heartbeat_timeout={hb_timeout}s, "
@@ -941,14 +1051,28 @@ def main():
     for sid in registry.site_ids():
         log(f"configured site '{sid}' -> {registry.name(sid)}")
 
+    ref_model, model_spec = build_model(
+        backbone,
+        weights_path=retfound_weights or None,
+        finetune=retfound_finetune,
+        input_hw=RETFOUND_INPUT_HW,
+    )
     reference = OrderedDict(
         (k, v.detach().cpu().numpy().copy())
-        for k, v in get_resnet50_binary().state_dict().items()
+        for k, v in ref_model.state_dict().items()
     )
-    log(f"global model initialised from ImageNet weights "
-        f"({len(reference)} tensors)")
+    n_bytes = sum(v.nbytes for v in reference.values())
+    source = "ImageNet weights" if backbone == "resnet" else Path(retfound_weights).name
+    log(f"global model initialised from {source} "
+        f"({len(reference)} tensors, {n_bytes / 1024**2:.0f} MB per transfer)")
+    fp = encoder_fingerprint(ref_model)
+    if fp is not None:
+        # a random-init ViT-L sits near 0.026; a loaded checkpoint does not
+        log(f"encoder fingerprint (mean |blocks.0.attn.qkv.weight|) = {fp:.6f}")
+        model_spec["encoder_fingerprint"] = fp
+    del ref_model
 
-    run = Run(registry, reference, num_rounds)
+    run = Run(registry, reference, num_rounds, model_spec=model_spec)
     agg = Aggregator(output_dir, tb_dir, dict(rc), min_nodes, registry)
 
     Handler.RUN = run
@@ -971,6 +1095,7 @@ def main():
             "epochs": local_epochs,
             "batch_size": batch_size,
             "max_per_class_train": caps["train_per_class"],
+            "layer_decay": retfound_layer_decay,
         }
 
     def eval_config(server_round: int):

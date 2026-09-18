@@ -2,15 +2,18 @@
 """
 Run a trained checkpoint over a held-out split and write the metrics.
 
-The checkpoint is a plain ResNet50 state_dict as saved by fl_server.py
+The checkpoint is a plain state_dict as saved by fl_server.py
 (model_best_val_auc.pth / model_federated_final.pth), so nothing federated is
 involved here — this is a single-process forward pass over one site's data.
+Pass --backbone retfound for a checkpoint from a RETFound run; the default is
+resnet, which is what every checkpoint written before that option existed is.
 
 Preprocessing matches the validation path exactly: the same crop rule (UniPD
-crops, UCD does not), the same resize to (image_size, 2*image_size), the same
-ImageNet normalization, no augmentation. Pass --cache-path to read .pt tensors
-from cache_images.py instead of decoding PNGs, exactly as the client does; the
-cache must contain the requested split.
+crops, UCD does not), the same ImageNet normalization, no augmentation. Images
+are resized to the model's input size — (image_size, 2*image_size) for the
+ResNet, 224x448 for RETFound. Pass --cache-path to read .pt tensors from
+cache_images.py instead of decoding PNGs, exactly as the client does; the cache
+must contain the requested split.
 
 Outputs, written to --out-dir:
     predictions.csv    one row per image: path, label, p(MS), prediction
@@ -39,7 +42,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from model import get_resnet50_binary
+from model import BACKBONES, RETFOUND_INPUT_HW, build_model
 from my_datasets import (CachedOCTDataset, UniversalOCTDataset,
                          get_cached_val_transform, get_val_transform,
                          read_cache_manifest)
@@ -51,8 +54,13 @@ DEFAULT_CHECKPOINT = "results/090726_test/model_best_val_auc.pth"
 DEFAULT_DATA_PATH = "/data/giacomo/Hereditary_MS/data/MS_cohort_non_MS_ctrls"
 
 
-def build_dataset(data_path, split, site, image_size, cache_path):
-    """Returns (dataset, num_workers). Mirrors fl_client.build_datasets' val path."""
+def build_dataset(data_path, split, site, image_size, cache_path, input_hw=None):
+    """Returns (dataset, num_workers). Mirrors fl_client.build_datasets' val path.
+
+    image_size is the *cache* size and must match how the cache was built.
+    input_hw is the model's input size, applied as a second resize — the two are
+    different for RETFound (512-tall cache, 224-tall model).
+    """
     crop = site.lower() == "unipd"
 
     if cache_path:
@@ -75,7 +83,9 @@ def build_dataset(data_path, split, site, image_size, cache_path):
                 f"the split first or drop --cache-path to decode PNGs"
             )
         print(f"[inference] cached {split}={split_dir} (built {manifest['created_at']})")
-        return CachedOCTDataset(split_dir, transform=get_cached_val_transform()), 8
+        return CachedOCTDataset(
+            split_dir, transform=get_cached_val_transform(input_hw)
+        ), 8
 
     split_dir = os.path.join(data_path, split)
     if not os.path.isdir(split_dir):
@@ -83,13 +93,14 @@ def build_dataset(data_path, split, site, image_size, cache_path):
     print(f"[inference] {split}={split_dir} crop={crop} image_size={image_size}")
     return (
         UniversalOCTDataset(
-            img_dir=split_dir, transform=get_val_transform(image_size, crop_img=crop)
+            img_dir=split_dir,
+            transform=get_val_transform(image_size, crop_img=crop, input_hw=input_hw),
         ),
         4,
     )
 
 
-def load_checkpoint(path, device):
+def load_checkpoint(path, device, backbone="resnet", input_hw=RETFOUND_INPUT_HW):
     """Load a bare state_dict, tolerating the common wrapped layouts."""
     blob = torch.load(path, map_location=device, weights_only=True)
     if isinstance(blob, dict):
@@ -101,7 +112,10 @@ def load_checkpoint(path, device):
         (k[len("module."):] if k.startswith("module.") else k, v)
         for k, v in blob.items()
     )
-    model = get_resnet50_binary(pretrained=False)
+    # Architecture only — the checkpoint supplies every weight.
+    model, _ = build_model(
+        backbone, weights_path=None, input_hw=input_hw, pretrained=False, quiet=True
+    )
     model.load_state_dict(state_dict, strict=True)
     return model.to(device).eval()
 
@@ -141,7 +155,10 @@ def write_predictions(path, samples, y_true, y_score, threshold, idx_to_class):
 def main():
     ap = argparse.ArgumentParser(description="Inference on a held-out OCT split")
     ap.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT,
-                    help=f"ResNet50 state_dict (default: {DEFAULT_CHECKPOINT})")
+                    help=f"model state_dict (default: {DEFAULT_CHECKPOINT})")
+    ap.add_argument("--backbone", default="resnet", choices=list(BACKBONES),
+                    help="architecture the checkpoint was trained with "
+                         "(default: resnet)")
     ap.add_argument("--data-path", default=DEFAULT_DATA_PATH,
                     help="directory holding the split subdirectories")
     ap.add_argument("--split", default="test", help="split to score (default: test)")
@@ -150,7 +167,8 @@ def main():
     ap.add_argument("--cache-path", default=None,
                     help="directory of .pt tensors from cache_images.py; "
                          "must contain the requested split")
-    ap.add_argument("--image-size", type=int, default=512)
+    ap.add_argument("--image-size", type=int, default=512,
+                    help="cache/decode size; must match how the cache was built")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--num-workers", type=int, default=None,
                     help="overrides the per-source default (4 raw / 8 cached)")
@@ -181,8 +199,13 @@ def main():
         device = torch.device("cpu")
         print("[inference] no CUDA available, using cpu")
 
+    # RETFound reads 224x448 while the cache stays at its build size, so the
+    # model input is a separate resize from --image-size.
+    input_hw = RETFOUND_INPUT_HW if args.backbone == "retfound" else None
+
     dataset, default_workers = build_dataset(
-        args.data_path, args.split, args.site, args.image_size, args.cache_path
+        args.data_path, args.split, args.site, args.image_size, args.cache_path,
+        input_hw=input_hw,
     )
     if len(dataset) == 0:
         raise SystemExit(f"the '{args.split}' split is empty")
@@ -197,8 +220,9 @@ def main():
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         num_workers=workers, pin_memory=device.type == "cuda")
 
-    model = load_checkpoint(ckpt, device)
-    print(f"[inference] loaded {ckpt}")
+    model = load_checkpoint(ckpt, device, backbone=args.backbone, input_hw=input_hw
+                            or RETFOUND_INPUT_HW)
+    print(f"[inference] loaded {ckpt} as {args.backbone}")
 
     loss, y_true, y_score = predict(model, loader, device)
 
@@ -218,6 +242,8 @@ def main():
 
     payload = {
         "checkpoint": str(ckpt.resolve()),
+        "backbone": args.backbone,
+        "model_input_hw": list(input_hw) if input_hw else None,
         "data_path": args.data_path,
         "cache_path": args.cache_path,
         "site": args.site,

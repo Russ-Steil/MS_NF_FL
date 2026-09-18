@@ -24,22 +24,26 @@ from torchvision import transforms, datasets
 
 # ---------------------------------------------------------------- on the fly
 
-def get_train_transform(image_size: int = 224, crop_img = True):
+def _target_hw(image_size, input_hw):
+    """Model input size. input_hw wins when given, else the (h, 2h) default."""
+    return tuple(input_hw) if input_hw is not None else (image_size, 2 * image_size)
+
+def get_train_transform(image_size: int = 224, crop_img = True, input_hw=None):
     return transforms.Compose([
         transforms.Lambda(lambda img: transforms.functional.crop(img, top=0, left=400, height=img.height, width=img.width - 400)) if crop_img else transforms.Lambda(lambda img: img),
-        transforms.Resize((image_size, 2*image_size)), 
-        transforms.ToTensor(), 
-        transforms.RandomRotation(15), 
+        transforms.Resize(_target_hw(image_size, input_hw)),
+        transforms.ToTensor(),
+        transforms.RandomRotation(15),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1), 
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) 
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-def get_val_transform(image_size: int = 224, crop_img = True):
+def get_val_transform(image_size: int = 224, crop_img = True, input_hw=None):
     return transforms.Compose([
         transforms.Lambda(lambda img: transforms.functional.crop(img, top=0, left=400, height=img.height, width=img.width - 400)) if crop_img else transforms.Lambda(lambda img: img),
-        transforms.Resize((image_size, 2*image_size)),  
-        transforms.ToTensor(), 
+        transforms.Resize(_target_hw(image_size, input_hw)),
+        transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
@@ -58,22 +62,36 @@ def _load_cached_tensor(path: str) -> torch.Tensor:
     return torch.load(path, map_location="cpu", weights_only=True)
 
 
-def get_cached_train_transform():
-    """Crop and resize are already baked into the cache."""
-    return transforms.Compose([
-        transforms.ConvertImageDtype(torch.float32),   # uint8 -> [0,1], as ToTensor did
+def get_cached_train_transform(input_hw=None):
+    """Crop and the cache-time resize are already baked into the cache.
+
+    input_hw is the *model* input (H, W), not the cache size: the cache is
+    512x1024 and RETFound wants 224x448, so that second resize happens here.
+    Pass None (the ResNet case) to feed the cache through at its native size.
+    The resize goes before the augmentations, so rotation and jitter run on the
+    smaller tensor, and before Normalize, so interpolation sees [0,1] pixels
+    rather than normalized values.
+    """
+    ops = [transforms.ConvertImageDtype(torch.float32)]  # uint8 -> [0,1], as ToTensor did
+    if input_hw is not None:
+        ops.append(transforms.Resize(tuple(input_hw), antialias=True))
+    ops += [
         transforms.RandomRotation(15),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    ]
+    return transforms.Compose(ops)
 
 
-def get_cached_val_transform():
-    return transforms.Compose([
-        transforms.ConvertImageDtype(torch.float32),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+def get_cached_val_transform(input_hw=None):
+    ops = [transforms.ConvertImageDtype(torch.float32)]
+    if input_hw is not None:
+        ops.append(transforms.Resize(tuple(input_hw), antialias=True))
+    ops.append(
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    )
+    return transforms.Compose(ops)
 
 
 class CachedOCTDataset(datasets.DatasetFolder):

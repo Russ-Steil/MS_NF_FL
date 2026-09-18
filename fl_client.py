@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Federated client for the ResNet50 MS classifier. No flwr.
+Federated client for the MS classifier. No flwr.
 
 Pulls the global weights from the server, trains locally, pushes weights and
 scalar metrics back. Nothing inbound is needed here, so this runs unchanged on
 a SLURM compute node.
+
+The architecture is not chosen here: the /join response names the backbone, the
+input resolution and the reference state_dict layout, and the client builds to
+match. That keeps the three processes from disagreeing about a state_dict that
+FedAvg matches positionally.
 
 A background heartbeat keeps the server's connection state current during long
 local epochs. Any fatal error is written to runs/fl_clients/<site>/<trial>/
@@ -33,9 +38,10 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from downsampler import build_downsampler
-from fl_common import (GREEN, META_HEADER, RED, deserialize_params, manifest_of,
-                       now_hms, now_iso, paint, serialize_params)
-from model import get_resnet50_binary
+from fl_common import (GREEN, META_HEADER, RED, WIRE_VERSION,
+                       deserialize_params, manifest_of, now_hms, now_iso, paint,
+                       serialize_params)
+from model import RETFOUND_INPUT_HW, build_model, encoder_fingerprint
 from my_datasets import (UCD_Dataset, UniPD_Dataset, CachedOCTDataset,
                          get_cached_train_transform, get_cached_val_transform,
                          get_train_transform, get_val_transform,
@@ -235,19 +241,25 @@ def _cap_from(config):
 
 
 class OCTClient:
+    """
+    Two-stage construction. __init__ builds only the datasets, because the
+    server needs this site's class counts in the /join request before it will
+    say which architecture to build. configure_model() does the rest, once the
+    /join response has come back.
+    """
 
-    def __init__(self, model, dataset_name, data_path, trial_tag, device,
+    def __init__(self, dataset_name, data_path, trial_tag, device,
                  cache_path=None):
-        self.model = model
+        self.model = None
+        self.manifest = None
+        self.backbone = "resnet"
+        self.finetune = True
         self.dataset_name = dataset_name
         self.data_path = data_path
         self.trial_tag = trial_tag
         self.device = device
         self.cache_path = cache_path
         self._cache = {}
-        self.manifest = manifest_of(OrderedDict(
-            (k, v.detach().cpu().numpy()) for k, v in model.state_dict().items()
-        ))
 
         log_dir = os.path.join("runs", "fl_clients", self.dataset_name, trial_tag)
         self.writer = SummaryWriter(log_dir=log_dir)
@@ -256,6 +268,106 @@ class OCTClient:
         self.train_ds, self.val_ds, self.num_workers = build_datasets(
             dataset_name, data_path, cache_path=cache_path
         )
+
+    def configure_model(self, info, weights_path=None):
+        """Build the model the server asked for and match the input resolution.
+
+        info is the /join response. Raises if the resulting state_dict does not
+        agree with the server's reference manifest, which is the only thing
+        keeping FedAvg's positional matching honest across two sites that may
+        not have identical library versions.
+        """
+        self.backbone = str(info.get("backbone", "resnet"))
+        self.finetune = bool(info.get("finetune", True))
+        input_hw = info.get("input_hw") or RETFOUND_INPUT_HW
+
+        print(f"[client:{self.dataset_name}] server asked for backbone="
+              f"{self.backbone} finetune={self.finetune}", flush=True)
+
+        model, _ = build_model(
+            self.backbone,
+            weights_path=weights_path or None,
+            finetune=self.finetune,
+            input_hw=input_hw,
+        )
+
+        # Both checks run while the model is still on the CPU: the manifest would
+        # otherwise pull 1.2 GB back off the GPU, and the fingerprint has to be
+        # reduced the same way the server reduced it to compare bit-for-bit.
+        self.manifest = manifest_of(OrderedDict(
+            (k, v.detach().numpy()) for k, v in model.state_dict().items()
+        ))
+        local_fp = encoder_fingerprint(model)
+
+        self._check_manifest(info.get("manifest"))
+        self._check_fingerprint(info.get("encoder_fingerprint"), local_fp, weights_path)
+
+        self.model = model.to(self.device)
+
+        # RETFound runs at 224x448 while the cache holds 512x1024, so the second
+        # resize goes in the transform. The cache itself is untouched.
+        self._set_input_hw(input_hw if self.backbone == "retfound" else None)
+
+    def _set_input_hw(self, input_hw):
+        if input_hw is None:
+            return
+        # Reassigning .transform on a built DatasetFolder is fine — __getitem__
+        # reads it per call — but only while no DataLoader has been made, since
+        # persistent workers would have forked a copy of the old one.
+        assert not self._cache, "loaders were built before the transform was set"
+        self.train_ds.transform = get_cached_train_transform(input_hw) \
+            if self.cache_path else get_train_transform(
+                crop_img=self.dataset_name.lower() == "unipd", input_hw=input_hw)
+        self.val_ds.transform = get_cached_val_transform(input_hw) \
+            if self.cache_path else get_val_transform(
+                crop_img=self.dataset_name.lower() == "unipd", input_hw=input_hw)
+        print(f"[client:{self.dataset_name}] model input "
+              f"{input_hw[0]}x{input_hw[1]}")
+
+    def _check_manifest(self, expected):
+        """Compare our state_dict layout against the server's, name by name."""
+        if not expected:
+            print(f"[client:{self.dataset_name}] server sent no manifest — "
+                  f"skipping the layout check (older server)", flush=True)
+            return
+        ours = self.manifest
+        if len(ours) != len(expected):
+            raise RuntimeError(
+                f"model layout differs from the server: {len(ours)} tensors "
+                f"locally, {len(expected)} on the server. Most likely a timm or "
+                f"torch version difference between the two sites."
+            )
+        diffs = [
+            f"{e[0]}{list(e[1])} != {o[0]}{list(o[1])}"
+            for e, o in zip(expected, ours)
+            if e[0] != o[0] or list(e[1]) != list(o[1])
+        ]
+        if diffs:
+            raise RuntimeError(
+                f"model layout differs from the server in {len(diffs)} tensor(s); "
+                f"first few: {diffs[:5]}. Check that both sites run the same timm "
+                f"version."
+            )
+        print(f"[client:{self.dataset_name}] model layout matches the server "
+              f"({len(ours)} tensors)", flush=True)
+
+    def _check_fingerprint(self, expected, ours, weights_path):
+        """Confirm our local RETFound is the same checkpoint the server seeded.
+
+        Only meaningful when --weights-path was given: without it the client
+        builds an untrained architecture and is overwritten from the server
+        anyway, so there is nothing to compare.
+        """
+        if expected is None or ours is None or not weights_path:
+            return
+        if abs(ours - float(expected)) > 1e-6:
+            raise RuntimeError(
+                f"local RETFound weights at {weights_path} differ from the "
+                f"server's (fingerprint {ours:.6f} vs {float(expected):.6f}). "
+                f"The sites are holding different checkpoints."
+            )
+        print(f"[client:{self.dataset_name}] local weights match the server's "
+              f"checkpoint (fingerprint {ours:.6f})", flush=True)
 
     def train_class_counts(self):
         """{class index: count} over the train split, reported to the server."""
@@ -315,6 +427,7 @@ class OCTClient:
         weight_decay = float(config["weight_decay"])
         epochs = int(config["epochs"])
         batch_size = int(config["batch_size"])
+        layer_decay = float(config.get("layer_decay", 0.75))
         max_per_class = _cap_from(config)
 
         print(
@@ -335,6 +448,9 @@ class OCTClient:
                 device=self.device,
                 lr=lr,
                 weight_decay=weight_decay,
+                backbone=self.backbone,
+                finetune=self.finetune,
+                layer_decay=layer_decay,
             )
         finally:
             self._release()
@@ -454,6 +570,11 @@ def main():
                     help="directory of .pt tensors from cache_images.py; "
                          "falls back to decoding from --data-path when omitted")
     ap.add_argument("--trial-tag", default="unknown")
+    ap.add_argument("--weights-path", default=None,
+                    help="this site's RETFound checkpoint. Optional: the server's "
+                         "copy is what seeds the federation, so this is used to "
+                         "verify the two sites hold the same checkpoint rather "
+                         "than to initialise training")
     ap.add_argument("--gpu-index", type=int, default=DEFAULT_GPU_INDEX)
     args = ap.parse_args()
 
@@ -492,8 +613,7 @@ def main():
             device = torch.device("cpu")
             print(f"[client:{dataset_name}] no CUDA available, using cpu")
 
-        model = get_resnet50_binary().to(device)
-        client = OCTClient(model, dataset_name, args.data_path, trial_tag, device,
+        client = OCTClient(dataset_name, args.data_path, trial_tag, device,
                            cache_path=args.cache_path)
 
         # the server needs every site's class counts to pick a common per-class
@@ -505,8 +625,21 @@ def main():
                     f"({info.get('num_rounds')} rounds), train counts {counts}",
                     GREEN), flush=True)
 
+        # Start beating before building the model. A ViT-L is a 1.2 GB read that
+        # can take minutes off cold NFS, and the server drops a silent site after
+        # heartbeat-timeout-s and aborts the whole run.
         hb = Heartbeat(transport, dataset_name)
         hb.start()
+
+        server_wire = info.get("wire_version")
+        if server_wire is not None and int(server_wire) != WIRE_VERSION:
+            raise RuntimeError(
+                f"wire version mismatch: this site has fl_common.py v{WIRE_VERSION}, "
+                f"the server has v{server_wire}. Redeploy fl_common.py so both "
+                f"sites match."
+            )
+
+        client.configure_model(info, weights_path=args.weights_path)
 
         last_fit, last_eval = 0, 0
         waiting_on = None

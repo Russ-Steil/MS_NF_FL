@@ -1,6 +1,15 @@
 """
-Training and evaluation functions for the ResNet50 binary classifier.
-Used by the Flower client for local fit and evaluate.
+Training and evaluation functions for the binary OCT classifier.
+Used by the federated client for local fit and evaluate.
+
+Two optimizer recipes, picked by backbone:
+  - resnet    SGD + momentum, unchanged from the original model
+  - retfound  AdamW + layer-wise LR decay, the canonical MAE fine-tune recipe
+
+The RETFound path is where MS_circle/train_circle.py went wrong: plain SGD on
+top of layer decay drove the early layers to an effective LR near 1e-9 and the
+model never moved. build_optimizer asserts the decay actually took effect, since
+the failure mode is silent — see _param_groups_lrd.
 """
 import os
 from typing import Tuple, Dict, Optional
@@ -22,6 +31,96 @@ import seaborn as sns
 from matplotlib.lines import Line2D
 
 
+def _param_groups_lrd(model: nn.Module, weight_decay: float, layer_decay: float = 0.75):
+    """Layer-wise LR decay groups for a ViT. Deeper layers get a larger LR.
+
+    Call this on the bare timm encoder, never on a wrapper. The layer id is read
+    off the start of the parameter name, so a prefix like "encoder.blocks.3.*"
+    matches nothing, falls through to the final `return num_layers`, and every
+    parameter silently lands in one group at lr_scale 1.0 — layer decay off, no
+    error raised. build_optimizer asserts against exactly that.
+    """
+    param_groups = {}
+    num_layers = len(model.blocks) + 1
+
+    def get_layer_id(name):
+        if name in ('cls_token', 'pos_embed'):
+            return 0
+        if name.startswith('patch_embed'):
+            return 0
+        if name.startswith('blocks'):
+            return int(name.split('.')[1]) + 1
+        return num_layers
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.endswith('.bias') or 'norm' in name:
+            g_decay, this_decay = "no_decay", 0.0
+        else:
+            g_decay, this_decay = "decay", weight_decay
+
+        layer_id = get_layer_id(name)
+        lr_scale = layer_decay ** (num_layers - layer_id)
+        group_name = f"layer_{layer_id}_{g_decay}"
+
+        if group_name not in param_groups:
+            param_groups[group_name] = {"lr_scale": lr_scale, "weight_decay": this_decay, "params": []}
+        param_groups[group_name]["params"].append(param)
+
+    return list(param_groups.values())
+
+
+def build_optimizer(
+    model: nn.Module,
+    backbone: str,
+    lr: float,
+    weight_decay: float,
+    finetune: bool = True,
+    layer_decay: float = 0.75,
+    verbose: bool = True,
+):
+    """SGD for the ResNet, AdamW + layer decay for RETFound."""
+    if backbone != "retfound":
+        return torch.optim.SGD(
+            model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay
+        )
+
+    # ViT-L in fp32: TF32 matmuls are a large free speedup and do not affect the
+    # master weights, so the wire format and the manifest are untouched.
+    torch.set_float32_matmul_precision("high")
+
+    groups = _param_groups_lrd(model.encoder, weight_decay, layer_decay=layer_decay)
+    head = [p for p in model.fc.parameters() if p.requires_grad]
+    if head:
+        # The head is new at every scale, so it trains at the full LR.
+        groups.append({"lr_scale": 1.0, "weight_decay": weight_decay, "params": head})
+
+    if finetune:
+        # 26 layer ids (patch_embed, 24 blocks, fc_norm) x a decay/no_decay split
+        # gives 51 encoder groups + the head, at 26 distinct scales. A result
+        # near 2 groups / 1 scale is the prefix bug described above.
+        n_scales = len({g["lr_scale"] for g in groups})
+        assert n_scales >= 25 and len(groups) > 40, (
+            f"layer decay did not take effect: {len(groups)} param groups with "
+            f"{n_scales} distinct lr_scale values (expected >40 groups / >=25 "
+            f"scales). _param_groups_lrd was probably given a wrapper module "
+            f"instead of the bare encoder."
+        )
+
+    for g in groups:
+        # pop, don't just read: a stray lr_scale key is accepted by AdamW without
+        # complaint and the scaling would be silently dropped.
+        g["lr"] = lr * g.pop("lr_scale")
+
+    if verbose:
+        lrs = sorted(g["lr"] for g in groups)
+        print(f"  [retfound] AdamW, {len(groups)} param groups, "
+              f"layer_decay={layer_decay}, lr {lrs[0]:.3e} .. {lrs[-1]:.3e}")
+
+    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.999))
+
+
 def train(
     model: nn.Module,
     trainloader: DataLoader,
@@ -29,11 +128,17 @@ def train(
     device: torch.device,
     lr: float = 0.0005,
     weight_decay: float = 0.005,
-    class_weights: Optional[torch.Tensor] = None
+    class_weights: Optional[torch.Tensor] = None,
+    backbone: str = "resnet",
+    finetune: bool = True,
+    layer_decay: float = 0.75,
 ) -> None:
     model.train()
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+    optimizer = build_optimizer(
+        model, backbone, lr, weight_decay,
+        finetune=finetune, layer_decay=layer_decay,
+    )
 
     for epoch in range(epochs):
         for images, labels in tqdm(trainloader, desc=f"Epoch {epoch+1}/{epochs}", total=len(trainloader)):

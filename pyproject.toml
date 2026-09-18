@@ -17,7 +17,12 @@ dependencies=[
     "scipy==1.17.1",
     "scikit-learn==1.9.0",
     "matplotlib==3.11.1",
-    "seaborn==0.13.2"
+    "seaborn==0.13.2",
+    # retfound backbone. timm is pinned because it has renamed ViT state_dict
+    # keys across releases, and FedAvg matches tensors positionally by name —
+    # a version skew between the two sites breaks the run at join.
+    "timm==1.0.27",
+    "safetensors==0.6.2"
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -41,7 +46,10 @@ exclude=[
 host = "0.0.0.0"
 port = 9092
 round-timeout-s = 7200
-heartbeat-timeout-s = 60
+# Generous on purpose: a client is silent while it builds its model, and a cold
+# 1.2 GB RETFound read off network storage can take minutes. Dropping a site
+# here aborts the entire run.
+heartbeat-timeout-s = 300
 
 [tool.fl.sites.ucd]
 display-name = "University of Denver"
@@ -54,8 +62,25 @@ token = "replace-me-unipd"
 [tool.fl.config]
 num-server-rounds = 60
 min-nodes = 2
+# lr / weight-decay apply to the resnet backbone (SGD + momentum)
 lr = 0.0005
 weight-decay = 0.0001
 local-epochs = 10
 batch-size = 16
 trial-tag = "trial7_1e5_10e_30r"
+
+# "resnet" or "retfound". Set it in run_trial.sh; the server hands it to every
+# client at /join so all three build the same architecture.
+backbone = "resnet"
+# The server's checkpoint seeds the whole federation, so this is required when
+# backbone = "retfound". Clients may pass their own copy via --weights-path,
+# which is checked against this one rather than used to initialise.
+retfound-weights = ""
+# false freezes the encoder and trains only fc_norm and the head
+retfound-finetune = true
+# AdamW settings. Kept separate from lr/weight-decay above because those are
+# SGD-scale numbers: 5e-4 through layer decay would leave patch_embed at
+# 5e-4 * 0.75^25 = 4e-7 and the early layers would never move.
+retfound-lr = 0.001
+retfound-weight-decay = 0.05
+retfound-layer-decay = 0.75

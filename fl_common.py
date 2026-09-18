@@ -8,10 +8,16 @@ Wire format: a .npz archive holding one array per state_dict entry, keyed
 positionally (a0, a1, ...), plus a "__manifest__" entry that is the JSON
 [[name, shape, dtype], ...] listing in state_dict order. Arrays are stored as
 at least 1-d and restored to their declared shape on read, because 0-d entries
-(BatchNorm's num_batches_tracked, 53 of them in ResNet50) do not round-trip
-through npz as 0-d. Loading is done with allow_pickle=False and validated
-against the receiver's own manifest, so a payload can never introduce an
-unexpected key, an unexpected element count, or executable content.
+(BatchNorm's num_batches_tracked, 53 of them in ResNet50; the RETFound ViT-L
+has none) do not round-trip through npz as 0-d. Loading is done with
+allow_pickle=False and validated against the receiver's own manifest, so a
+payload can never introduce an unexpected key, an unexpected element count, or
+executable content.
+
+WIRE_VERSION is reported by the server at /join and checked by the client.
+Bump it whenever a change here makes old and new copies of this file
+incompatible on the wire, so a half-deployed federation fails at startup with a
+clear message instead of mid-round.
 """
 import io
 import json
@@ -21,9 +27,14 @@ from datetime import datetime
 
 import numpy as np
 
-WIRE_VERSION = 1
+# 2: raised MAX_BODY_BYTES to admit the 1.21 GB RETFound ViT-L payload. A v1
+# peer caps at 512 MB and would reject it, so the versions cannot interoperate
+# on a retfound run.
+WIRE_VERSION = 2
 META_HEADER = "X-FL-Meta"
-MAX_BODY_BYTES = 512 * 1024 * 1024
+# ResNet50 serializes to ~95 MB, the RETFound ViT-L to ~1.21 GB. 2 GB leaves
+# 1.7x headroom over the larger of the two.
+MAX_BODY_BYTES = 2 * 1024 * 1024 * 1024
 
 GREEN = "\033[92m"
 RED = "\033[91m"
