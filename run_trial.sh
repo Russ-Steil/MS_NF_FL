@@ -12,6 +12,7 @@
 python run_server.py --run-config 'backbone=retfound
   retfound-weights="/data/russ/weights/retfound_oct.safetensors"
   retfound-lr=0.001
-  batch-size=16
+  batch-size=4
   local-epochs=10
-  trial-tag="20260918_retfound"'
+  save-round-weights=true
+  trial-tag="20260930_retfound_lr001_weights_saved"'

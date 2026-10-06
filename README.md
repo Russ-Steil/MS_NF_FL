@@ -53,12 +53,20 @@ no site dominates the `num_examples`-weighted FedAvg.
 
 The subset is **redrawn every epoch**, so a large site still works through all of
 its data over the course of the run — nothing is permanently discarded. The site
-that sets the cap trains on everything it would have anyway. Validation is *not*
-capped: every site always evaluates on its complete validation set.
+that sets the cap trains on everything it would have anyway.
+
+Validation is capped too, differently. Each client also reports its val class
+counts, and the server sets the **val size** to the smallest whole val split across
+sites. The site that sets it validates on its entire val split; a larger site
+validates on a **fixed** subset of that size — class-stratified (its own class
+ratio is kept), drawn once with a fixed seed (`VAL_SUBSET_SEED` in
+`downsampler.py`) and identical every round and every run. Since the global val
+metrics are weighted by each site's val size, this weights the sites equally, so
+the larger site no longer dominates the best-val-AUC model selection.
 
 If a client joins without reporting counts, the server logs a warning and leaves
 the run uncapped; each site then falls back to balancing against its own minority
-class.
+class (train) and validating on its whole val split (val).
 
 Each federated round:
 
@@ -105,8 +113,10 @@ during long local epochs.
 | `train.py` | Local `train` / `evaluate` loops, `safe_auc`, metric/stat helpers, plotting (loss/AUC/ROC/confusion) |
 | `my_datasets.py` | `UniversalOCTDataset` (on-the-fly crop/resize) and `CachedOCTDataset` (reads pre-cached `.pt` tensors); train/val transforms |
 | `cache_images.py` | One-time pre-caching of OCT images to uint8 tensors (bakes in crop + resize) to remove PIL decode from the training loop |
-| `downsampler.py` | `_BalancedDownsampler` — draws an equal, capped number of training images per class each epoch (see below) |
+| `downsampler.py` | `_BalancedDownsampler` — draws an equal, capped number of training images per class each epoch; `fixed_subset_indices` — the fixed, stratified val subset (see below) |
 | `run_server.py` | Thin entry point that calls `fl_server.main()` |
+| `visualization/visualize_trajectory.py` | Post-hoc report: weight-space trajectory (PCA), site update alignment, per-round metrics (see [Visualization](#visualization)) |
+| `entropy_uq.py` | Youden-threshold + entropy uncertainty analysis used by `inference.py` (threshold picked on `--val-split`, applied to `--split`; written to `<out-dir>/youden` and `youden_patient`) |
 | `*.sh` | Convenience launch scripts (see below) |
 
 ### Sites and data layout
@@ -268,6 +278,13 @@ server's `/join` response. The optional `--weights-path` points at this site's o
 RETFound checkpoint and is used to verify it matches the server's, not to
 initialise training.
 
+When the run finishes cleanly each site writes its own copy of the final global
+weights to `runs/fl_clients/<site>/<trial>/model_federated_final.pth`, or to
+`--save-path`. Nothing is transferred to produce it: the client already holds
+the last round's aggregate from the evaluate phase, so the file is identical to
+the server's. Worth redirecting on a retfound run — it is ~1.2 GB and the
+default is relative to the launch directory.
+
 ## Outputs
 
 Per trial, under `RESULTS_ROOT/<trial-tag>/`:
@@ -278,5 +295,57 @@ Per trial, under `RESULTS_ROOT/<trial-tag>/`:
 - `loss_curves.png`, `auc_curves.png` — training curves
 - `final_metrics.json` — full history, best round, and (on failure) the abort reason
 - `log.log`, `failure.log`
+- `round_weights/` — only with `save-round-weights = true`: `round_000_server.pth` (the
+  initial global model), then per round `round_NNN_client_<site>.pth` (each site's upload)
+  and `round_NNN_server.pth` (their FedAvg). `(sites + 1) × rounds + 1` files, ~95 MB each
+  for resnet and ~1.2 GB each for retfound
 
 TensorBoard scalars (global, per-site, and overlay comparisons) are written under `TB_ROOT/<trial-tag>/`.
+
+Per client, under `runs/fl_clients/<site>/<trial-tag>/` (or `--save-path`):
+
+- `model_federated_final.pth` — this site's copy of the same final weights, tagged
+  with the backbone, input size and round it came from, so `inference.py` can load
+  it without being told what it is
+- `failure.log` — written only if this client aborted
+- TensorBoard scalars for this site's local train/val metrics
+
+## Visualization
+
+`visualization/visualize_trajectory.py` builds a report for a finished (or running) trial,
+adapted from the Flower CIFAR-10 example:
+
+```bash
+pip install plotly            # optional: inlines plotly.js so the HTML works offline
+python visualization/visualize_trajectory.py                      # most recent trial
+python visualization/visualize_trajectory.py --trial trial9_1e5_10e_60r
+python visualization/visualize_trajectory.py --trial <tag> --out-dir /some/other/dir
+```
+
+Written to the trial directory (or `--out-dir`):
+
+- `<trial>_report.html` — interactive page: 3D trajectory, alignment, metric panels, round slider
+- `trajectory_3d.png` — static version of the trajectory
+- `trajectory_pca.csv` — PC1–3 coordinates of every checkpoint
+- `client_similarity.csv` — per-round cosine similarity of the site update deltas
+
+What it shows:
+
+- **Trajectory through weight space** — every `round_weights/` checkpoint projected onto
+  the same 3 principal components. The global model's path runs in black; dotted arrows
+  go from the global model of round r−1 to each site's upload in round r.
+- **Site update alignment** — cosine similarity of (site upload − previous global) between
+  sites, per round, in the full weight space. Positive means the sites pull the model the
+  same way; near zero or negative means their data disagree.
+- **Metric panels** — from `metrics_global.csv` / `metrics_per_site.csv`: the global model
+  on each site's validation set, and each site's update on its own training data. There is
+  no shared test set (images never leave a site), so per-site lines are on different data
+  and are not comparable to each other.
+
+The trajectory and alignment panels need a run made with `save-round-weights = true`;
+without `round_weights/` the report still renders the metric panels. Checkpoints are
+memory-mapped and reduced chunk by chunk to an N×N Gram matrix, so a 60-round RETFound
+run (~180 × 1.2 GB) never needs more than about 1 GB of RAM. It does read every file
+once, though, so expect that run to be I/O-bound. BatchNorm running statistics are
+excluded from the geometry. The script also checks that each saved server file equals
+the n-weighted mean of that round's client files, and prints the result.

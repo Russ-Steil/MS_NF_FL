@@ -1,0 +1,1 @@
+python visualization/visualize_trajectory.py --trial 20260930_retfound_lr001_weights_saved

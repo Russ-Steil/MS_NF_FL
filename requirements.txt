@@ -18,3 +18,7 @@ safetensors==0.6.2
 
 # tomli is only needed on Python < 3.11 (the stdlib gained tomllib in 3.11)
 tomli==2.2.1; python_version < "3.11"
+
+# optional: visualization/visualize_trajectory.py inlines plotly.js into the report
+# when installed (otherwise the page loads it from the CDN)
+plotly

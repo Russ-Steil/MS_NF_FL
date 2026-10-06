@@ -42,6 +42,37 @@ def build_downsampler(labels, per_class=None, seed=None):
     return _BalancedDownsampler(labels, per_class=per_class, seed=seed)
 
 
+VAL_SUBSET_SEED = 1234
+
+
+def fixed_subset_indices(labels, total, seed=VAL_SUBSET_SEED):
+    """
+    A fixed, class-stratified subset of `total` indices, for validation.
+
+    Unlike the train downsampler this is drawn once and never redrawn: the same
+    labels, total and seed give the same indices on every call, every round and
+    every run (the datasets list their files in sorted order). The class ratio
+    of `labels` is kept — each class gets its proportional share, with the
+    rounding remainder going to the largest fractional parts — so a site
+    shrunk to match a smaller one still validates on its own class mix.
+
+    Returns all indices, in order, when total is None or >= len(labels).
+    """
+    labels = np.asarray(labels)
+    if total is None or int(total) >= len(labels):
+        return np.arange(len(labels))
+    total = int(total)
+    classes, counts = np.unique(labels, return_counts=True)
+    share = counts * total / len(labels)
+    take = np.floor(share).astype(int)
+    for i in np.argsort(-(share - take), kind="stable")[:total - take.sum()]:
+        take[i] += 1
+    gen = np.random.default_rng(seed)
+    picked = [gen.permutation(np.flatnonzero(labels == c))[:k]
+              for c, k in zip(classes, take)]
+    return np.sort(np.concatenate(picked))
+
+
 def min_class_count(labels):
     """Largest per-class draw these labels support, i.e. the minority count."""
     _, counts = np.unique(np.asarray(labels), return_counts=True)

@@ -23,7 +23,8 @@ than min-nodes, aborts the whole run. The reason names the site and is written
 to failure.log and final_metrics.json before the process exits non-zero.
 
 Endpoints (all require Authorization: Bearer <site token>):
-    POST /join       register, optional X-FL-Meta {train_class_counts};
+    POST /join       register, optional X-FL-Meta {train_class_counts,
+                     val_class_counts};
                      returns run identity, the model spec and the reference
                      manifest
     GET  /status     phase, round, config for this round, submitted flag
@@ -143,6 +144,28 @@ def train_cap_from_counts(site_counts, participants, registry):
         per_site[sid] = min(counts.values())
     if not per_site:
         return None, "no participants reported train class counts"
+    return min(per_site.values()), per_site
+
+
+def val_cap_from_counts(site_val_counts, participants, registry):
+    """
+    The val size every site shares: the smallest whole val split across
+    participants. The site that sets it validates on everything; larger sites
+    validate on a fixed, class-stratified subset of that size (drawn once
+    client-side, identical every round), so the size-weighted global val
+    metrics weight the sites equally.
+
+    Returns (cap, {site: its own val size}), or (None, reason) if some
+    participant never reported.
+    """
+    per_site = {}
+    for sid in sorted(participants):
+        counts = site_val_counts.get(sid)
+        if not counts:
+            return None, f"{registry.name(sid)} reported no val class counts"
+        per_site[sid] = sum(counts.values())
+    if not per_site:
+        return None, "no participants reported val class counts"
     return min(per_site.values()), per_site
 
 
@@ -313,6 +336,7 @@ class Run:
         self.fit_results = {}           # site -> (n, params, metrics)
         self.eval_results = {}          # site -> (loss, n, metrics)
         self.site_counts = {}           # site -> {class index: train count}
+        self.site_val_counts = {}       # site -> {class index: val count}
         self.participants = set()
         self.abort_reasons = None
 
@@ -469,6 +493,14 @@ class Handler(BaseHTTPRequestHandler):
                     log(f"{run.registry.name(site)} reports train class counts {counts}")
                 else:
                     log(f"{run.registry.name(site)} joined without train class counts")
+                val_counts = (json.loads(raw) if raw else {}).get("val_class_counts")
+                if val_counts:
+                    val_counts = {int(k): int(v) for k, v in val_counts.items()}
+                    with run.cv:
+                        run.site_val_counts[site] = val_counts
+                    log(f"{run.registry.name(site)} reports val class counts {val_counts}")
+                else:
+                    log(f"{run.registry.name(site)} joined without val class counts")
 
                 payload = {
                     "site_id": site,
@@ -547,9 +579,16 @@ class Handler(BaseHTTPRequestHandler):
 class Aggregator:
     """FedAvg plus timestamps, per-site metric tracking, TensorBoard, checkpointing."""
 
-    def __init__(self, output_dir, tb_dir, run_config, expected_nodes, registry):
+    def __init__(self, output_dir, tb_dir, run_config, expected_nodes, registry,
+                 save_round_weights=False):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # every client update plus the aggregate, every round
+        self.round_weights_dir = None
+        if save_round_weights:
+            self.round_weights_dir = self.output_dir / "round_weights"
+            self.round_weights_dir.mkdir(parents=True, exist_ok=True)
 
         self.tb_dir = Path(tb_dir)
         self.tb_dir.mkdir(parents=True, exist_ok=True)
@@ -690,7 +729,37 @@ class Aggregator:
         torch.save(state_dict, self.output_dir / "model_federated_final.pth")
         self._last_state_dict = state_dict
 
+        if self.round_weights_dir is not None:
+            self._save_round_weights(server_round, results, state_dict)
+
         return agg
+
+    def _save_round_weights(self, server_round, results, server_state_dict):
+        """
+        Client weights are each site's upload after local training in this
+        round (started from the previous round's global); server weights are
+        the FedAvg of those uploads. Same state_dict layout as the .pth
+        checkpoints, so any of them loads with build_model() + load_state_dict.
+        """
+        d = self.round_weights_dir
+        for site, _n, params, _m in results:
+            sd = OrderedDict((k, torch.as_tensor(np.array(v))) for k, v in params.items())
+            torch.save(sd, d / f"round_{server_round:03d}_client_{site}.pth")
+        torch.save(server_state_dict, d / f"round_{server_round:03d}_server.pth")
+        log(f"round {server_round} — saved {len(results)} client + 1 server "
+            f"weights to {d}")
+
+    def save_initial_weights(self, reference):
+        """
+        The global model every site starts round 1 from. Without it the round 1
+        client updates have no origin, and the trajectory has no starting point.
+        """
+        if self.round_weights_dir is None:
+            return
+        sd = OrderedDict((k, torch.as_tensor(np.array(v))) for k, v in reference.items())
+        path = self.round_weights_dir / "round_000_server.pth"
+        torch.save(sd, path)
+        log(f"saved initial global weights to {path}")
 
     # ---------- evaluate ----------
 
@@ -984,6 +1053,8 @@ def main():
             f"run-config 'backbone' must be one of {list(BACKBONES)}, got {backbone!r}"
         )
 
+    save_round_weights = as_bool(rc.get("save-round-weights", False), "save-round-weights")
+
     retfound_weights = str(rc.get("retfound-weights", "")).strip()
     retfound_finetune = as_bool(rc.get("retfound-finetune", True), "retfound-finetune")
     retfound_layer_decay = float(rc.get("retfound-layer-decay", 0.75))
@@ -1072,8 +1143,16 @@ def main():
         model_spec["encoder_fingerprint"] = fp
     del ref_model
 
+    if save_round_weights:
+        # (sites + server) per round, plus the round 0 initial model
+        n_files = num_rounds * (len(registry.site_ids()) + 1) + 1
+        log(f"save-round-weights on: {n_files} files, ~{n_files * n_bytes / 1024**3:.1f} GB "
+            f"-> {output_dir / 'round_weights'}")
+
     run = Run(registry, reference, num_rounds, model_spec=model_spec)
-    agg = Aggregator(output_dir, tb_dir, dict(rc), min_nodes, registry)
+    agg = Aggregator(output_dir, tb_dir, dict(rc), min_nodes, registry,
+                     save_round_weights=save_round_weights)
+    agg.save_initial_weights(reference)
 
     Handler.RUN = run
     httpd = ThreadingHTTPServer((host, port), Handler)
@@ -1085,7 +1164,7 @@ def main():
 
     # filled in once every participant has joined and reported its class counts;
     # eval reads it too so the client builds a single set of loaders
-    caps = {"train_per_class": None}
+    caps = {"train_per_class": None, "val_total": None}
 
     def fit_config(server_round: int):
         return {
@@ -1095,6 +1174,7 @@ def main():
             "epochs": local_epochs,
             "batch_size": batch_size,
             "max_per_class_train": caps["train_per_class"],
+            "max_val_total": caps["val_total"],
             "layer_decay": retfound_layer_decay,
         }
 
@@ -1103,6 +1183,7 @@ def main():
             "server_round": server_round,
             "batch_size": batch_size,
             "max_per_class_train": caps["train_per_class"],
+            "max_val_total": caps["val_total"],
         }
 
     def resolve_train_cap():
@@ -1120,9 +1201,25 @@ def main():
         event(f"train cap set to {cap} images per class "
               f"({2 * cap} per epoch at every site)", CYAN)
 
+    def resolve_val_cap():
+        with run.cv:
+            counts = dict(run.site_val_counts)
+            participants = set(run.participants)
+        cap, detail = val_cap_from_counts(counts, participants, registry)
+        if cap is None:
+            event(f"no common val size: {detail} — each site will validate on "
+                  f"its whole val split", RED)
+            return
+        caps["val_total"] = cap
+        for sid, own in sorted(detail.items()):
+            log(f"  {registry.name(sid)}: val split has {own} images")
+        event(f"val size set to {cap} images at every site (fixed subset, "
+              f"same images every round)", CYAN)
+
     try:
         orch.wait_for_participants()
         resolve_train_cap()
+        resolve_val_cap()
         orch.run_rounds(fit_config, eval_config)
     except RunAborted as exc:
         run.finish("aborted")

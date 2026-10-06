@@ -60,7 +60,7 @@ display-name = "University of Padova"
 token = "replace-me-unipd"
 
 [tool.fl.config]
-num-server-rounds = 60
+num-server-rounds = 30
 min-nodes = 2
 # lr / weight-decay apply to the resnet backbone (SGD + momentum)
 lr = 0.0005
@@ -68,6 +68,11 @@ weight-decay = 0.0001
 local-epochs = 10
 batch-size = 16
 trial-tag = "trial7_1e5_10e_30r"
+# true saves every client's upload and the aggregated server weights each round
+# to results/<trial-tag>/round_weights/ — (sites + 1) x rounds files, plus the
+# round 0 initial model. Large for retfound (~1.2 GB each). Plot them with
+# visualization/visualize_trajectory.py.
+save-round-weights = false
 
 # "resnet" or "retfound". Set it in run_trial.sh; the server hands it to every
 # client at /join so all three build the same architecture.

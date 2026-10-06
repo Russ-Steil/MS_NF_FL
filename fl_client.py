@@ -15,6 +15,11 @@ A background heartbeat keeps the server's connection state current during long
 local epochs. Any fatal error is written to runs/fl_clients/<site>/<trial>/
 failure.log, reported to the server so the run aborts with a named reason, and
 then the process exits non-zero.
+
+On a clean finish the site keeps its own copy of the final global weights in the
+same directory (model_federated_final.pth, or --save-path). It is the same model
+the server saves — both ends end up holding it, so neither has to ship a 1.2 GB
+file to the other afterwards.
 """
 import argparse
 import gc
@@ -37,7 +42,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from downsampler import build_downsampler
+from downsampler import build_downsampler, fixed_subset_indices
 from fl_common import (GREEN, META_HEADER, RED, WIRE_VERSION,
                        deserialize_params, manifest_of, now_hms, now_iso, paint,
                        serialize_params)
@@ -141,12 +146,22 @@ def build_datasets(dataset_name, data_path, image_size=512, cache_path=None):
     return train_ds, val_ds, num_workers
 
 
-def build_loaders(train_ds, val_ds, num_workers, batch_size, max_per_class=None):
+def build_loaders(train_ds, val_ds, num_workers, batch_size, max_per_class=None,
+                  max_val_total=None):
     """
     Train is drawn through the balanced downsampler, capped at max_per_class
     images per class so every site trains on the same number of images per
-    epoch. The subset is redrawn on each epoch. Val is left whole.
+    epoch. The subset is redrawn on each epoch.
+
+    Val is cut to max_val_total images — the smallest val split across sites —
+    so every site validates on the same number of images and the larger site no
+    longer dominates the size-weighted global val metrics. The cut is a fixed,
+    class-stratified subset (same images every round and every run); the site
+    that sets the total keeps its whole val split. None leaves val whole.
     """
+    val_idx = fixed_subset_indices(np.array(val_ds.targets), max_val_total)
+    if len(val_idx) < len(val_ds):
+        val_ds = torch.utils.data.Subset(val_ds, val_idx.tolist())
     sampler = build_downsampler(np.array(train_ds.targets), per_class=max_per_class)
     trainloader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, sampler=sampler,
@@ -162,12 +177,13 @@ def build_loaders(train_ds, val_ds, num_workers, batch_size, max_per_class=None)
 
 
 def get_dataloaders(dataset_name, data_path, batch_size=4, image_size=512,
-                    cache_path=None, max_per_class=None):
+                    cache_path=None, max_per_class=None, max_val_total=None):
     train_ds, val_ds, num_workers = build_datasets(
         dataset_name, data_path, image_size=image_size, cache_path=cache_path
     )
     trainloader, testloader, num_examples, _ = build_loaders(
-        train_ds, val_ds, num_workers, batch_size, max_per_class=max_per_class
+        train_ds, val_ds, num_workers, batch_size, max_per_class=max_per_class,
+        max_val_total=max_val_total
     )
     return trainloader, testloader, num_examples
 
@@ -208,8 +224,9 @@ class Transport:
                     time.sleep(HTTP_BACKOFF_S * attempt)
         raise RuntimeError(f"{method} {path} failed after {HTTP_RETRIES} attempts: {last}")
 
-    def join(self, train_class_counts):
-        meta = {"train_class_counts": train_class_counts}
+    def join(self, train_class_counts, val_class_counts=None):
+        meta = {"train_class_counts": train_class_counts,
+                "val_class_counts": val_class_counts}
         return self._request("POST", "/join", body=b"", meta=meta)
 
     def status(self):
@@ -240,6 +257,12 @@ def _cap_from(config):
     return None if cap is None else int(cap)
 
 
+def _val_cap_from(config):
+    """The server's val total (smallest val split across sites), or None."""
+    cap = config.get("max_val_total")
+    return None if cap is None else int(cap)
+
+
 class OCTClient:
     """
     Two-stage construction. __init__ builds only the datasets, because the
@@ -254,6 +277,7 @@ class OCTClient:
         self.manifest = None
         self.backbone = "resnet"
         self.finetune = True
+        self.input_hw = None
         self.dataset_name = dataset_name
         self.data_path = data_path
         self.trial_tag = trial_tag
@@ -261,8 +285,8 @@ class OCTClient:
         self.cache_path = cache_path
         self._cache = {}
 
-        log_dir = os.path.join("runs", "fl_clients", self.dataset_name, trial_tag)
-        self.writer = SummaryWriter(log_dir=log_dir)
+        self.out_dir = Path("runs") / "fl_clients" / self.dataset_name / trial_tag
+        self.writer = SummaryWriter(log_dir=str(self.out_dir))
 
         # built once: the server needs the class counts before the first round
         self.train_ds, self.val_ds, self.num_workers = build_datasets(
@@ -306,7 +330,8 @@ class OCTClient:
 
         # RETFound runs at 224x448 while the cache holds 512x1024, so the second
         # resize goes in the transform. The cache itself is untouched.
-        self._set_input_hw(input_hw if self.backbone == "retfound" else None)
+        self.input_hw = tuple(input_hw) if self.backbone == "retfound" else None
+        self._set_input_hw(self.input_hw)
 
     def _set_input_hw(self, input_hw):
         if input_hw is None:
@@ -374,17 +399,24 @@ class OCTClient:
         classes, counts = np.unique(np.array(self.train_ds.targets), return_counts=True)
         return {int(c): int(n) for c, n in zip(classes, counts)}
 
-    def _loaders(self, batch_size, max_per_class):
-        key = (batch_size, max_per_class)
+    def val_class_counts(self):
+        """{class index: count} over the whole val split, reported to the server."""
+        classes, counts = np.unique(np.array(self.val_ds.targets), return_counts=True)
+        return {int(c): int(n) for c, n in zip(classes, counts)}
+
+    def _loaders(self, batch_size, max_per_class, max_val_total=None):
+        key = (batch_size, max_per_class, max_val_total)
         if key not in self._cache:
             loaders = build_loaders(
                 self.train_ds, self.val_ds, self.num_workers, batch_size,
-                max_per_class=max_per_class
+                max_per_class=max_per_class, max_val_total=max_val_total
             )
-            sampler = loaders[3]
+            sampler, n_val = loaders[3], loaders[2]["testset"]
             print(f"[client:{self.dataset_name}] train draw "
                   f"{sampler.per_class}/class -> {len(sampler)} images per epoch "
-                  f"(cap from server: {max_per_class}), val {len(self.val_ds)} images")
+                  f"(cap from server: {max_per_class}), val {n_val} of "
+                  f"{len(self.val_ds)} images (fixed subset, cap from server: "
+                  f"{max_val_total})")
             self._cache[key] = loaders
         return self._cache[key][:3]
 
@@ -422,6 +454,45 @@ class OCTClient:
         del state_dict, params
         self._release()
 
+    def save_final(self, server_round, path=None):
+        """Write this site's own copy of the final global weights.
+
+        Nothing is fetched here. The model already holds the final aggregate:
+        the last thing the client did was pull the round-N weights for the
+        evaluate phase, so this is bit-identical to the server's
+        model_federated_final.pth. Re-pulling would also race the server, which
+        stops serving shortly after it announces the run is done.
+
+        Saved wrapped rather than as a bare state_dict so the file carries the
+        backbone and input size with it — a 296-tensor ViT-L checkpoint sitting
+        on a remote site is otherwise indistinguishable from any other, and
+        inference.py needs both to rebuild the architecture. load_checkpoint()
+        unwraps it, and torch.load(weights_only=True) still accepts it.
+        """
+        if self.model is None:
+            return None
+
+        path = Path(path) if path else self.out_dir / "model_federated_final.pth"
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        state_dict = OrderedDict(
+            (k, v.detach().to("cpu", copy=True))
+            for k, v in self.model.state_dict().items()
+        )
+        torch.save({
+            "state_dict": state_dict,
+            "backbone": self.backbone,
+            "input_hw": list(self.input_hw) if self.input_hw else None,
+            "round": int(server_round),
+            "site": self.dataset_name,
+            "trial_tag": self.trial_tag,
+            "saved_at": now_iso(),
+        }, path)
+
+        del state_dict
+        self._release()
+        return path
+
     def fit(self, rnd, config):
         lr = float(config["lr"])
         weight_decay = float(config["weight_decay"])
@@ -439,7 +510,8 @@ class OCTClient:
             torch.cuda.reset_peak_memory_stats(self.device)
         self._log_gpu(f"round {rnd} fit-start")
 
-        trainloader, _, num_examples = self._loaders(batch_size, max_per_class)
+        trainloader, _, num_examples = self._loaders(batch_size, max_per_class,
+                                                     _val_cap_from(config))
         try:
             train(
                 self.model,
@@ -492,7 +564,8 @@ class OCTClient:
 
     def evaluate(self, rnd, config):
         batch_size = int(config.get("batch_size", 4))
-        _, testloader, num_examples = self._loaders(batch_size, _cap_from(config))
+        _, testloader, num_examples = self._loaders(batch_size, _cap_from(config),
+                                                    _val_cap_from(config))
 
         self._log_gpu(f"round {rnd} eval-start")
 
@@ -575,6 +648,11 @@ def main():
                          "copy is what seeds the federation, so this is used to "
                          "verify the two sites hold the same checkpoint rather "
                          "than to initialise training")
+    ap.add_argument("--save-path", default=None,
+                    help="where to write this site's copy of the final global "
+                         "weights (default: runs/fl_clients/<site>/<trial>/"
+                         "model_federated_final.pth). Worth setting for a "
+                         "retfound run — the file is ~1.2 GB")
     ap.add_argument("--gpu-index", type=int, default=DEFAULT_GPU_INDEX)
     args = ap.parse_args()
 
@@ -619,10 +697,12 @@ def main():
         # the server needs every site's class counts to pick a common per-class
         # train cap, so they go out with the join
         counts = client.train_class_counts()
-        info = transport.join(counts)
+        val_counts = client.val_class_counts()
+        info = transport.join(counts, val_counts)
         display = info.get("display_name", dataset_name)
         print(paint(f"[client:{dataset_name}] joined as {display} at {now_hms()} "
-                    f"({info.get('num_rounds')} rounds), train counts {counts}",
+                    f"({info.get('num_rounds')} rounds), train counts {counts}, "
+                    f"val counts {val_counts}",
                     GREEN), flush=True)
 
         # Start beating before building the model. A ViT-L is a 1.2 GB read that
@@ -651,6 +731,20 @@ def main():
             if phase == "done":
                 print(paint(f"[client:{dataset_name}] run finished at {now_hms()}",
                             GREEN), flush=True)
+                # Never let a bad save path turn a finished run into a failure —
+                # the server holds the authoritative copy of the same weights.
+                try:
+                    if last_eval > 0:
+                        saved = client.save_final(last_eval, path=args.save_path)
+                        print(paint(f"[client:{dataset_name}] final global weights "
+                                    f"(round {last_eval}) saved to {saved.resolve()}",
+                                    GREEN), flush=True)
+                    else:
+                        print(f"[client:{dataset_name}] no round completed here — "
+                              f"nothing to save", flush=True)
+                except Exception as e:
+                    print(f"[client:{dataset_name}] could not save final weights: "
+                          f"{e}", file=sys.stderr, flush=True)
                 break
 
             if phase == "aborted":
