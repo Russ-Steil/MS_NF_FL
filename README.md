@@ -13,7 +13,7 @@ Two backbones are available, selected by `backbone` in the run config
 | `resnet` (default) | ResNet50, ImageNet weights | 512x1024 | SGD + momentum | ~95 MB |
 | `retfound` | RETFound ViT-L/16, MAE-pretrained on retinal images | 224x448 | AdamW + layer-wise LR decay | ~1.21 GB |
 
-The federation is implemented over **plain HTTP with the Python standard library** — there is no
+The federation is implemented over **HTTPS (TLS) with the Python standard library** — there is no
 Flower runtime, no gRPC, and nothing needs to listen on an inbound port at the client sites. This
 was a deliberate rewrite of an earlier Flower-based version so that clients can run unmodified on a
 SLURM compute node that can only make *outbound* connections.
@@ -264,7 +264,8 @@ FL_TOKEN=replace-me-ucd python fl_client.py \
   --site ucd \
   --data-path /path/to/data \
   --cache-path /path/to/cache/ucd_512 \
-  --server http://<server-host>:9092 \
+  --server https://<server-host>:9092 \
+  --ca-cert certs/ca.crt \
   --trial-tag my_trial \
   --gpu-index 0
 ```
@@ -285,6 +286,33 @@ the last round's aggregate from the evaluate phase, so the file is identical to
 the server's. Worth redirecting on a retfound run — it is ~1.2 GB and the
 default is relative to the launch directory.
 
+## TLS certificates
+
+All traffic is TLS 1.2 or newer. The server will not start without `tls-cert` / `tls-key` in
+`[tool.fl.server]`, and clients refuse plain `http://` URLs. The bearer tokens are still checked,
+as a second factor.
+
+The certificates and tokens are **the same as in `MS_FL_DEBUG`**, so Padova uses one `ca.crt` and
+one token for both repos. The files in `certs/` are:
+
+- `ca.crt`: public. Clients verify the server against it with `--ca-cert`, which defaults to
+  `certs/ca.crt`. It is the only file Padova needs.
+- `server.crt` and `server.key`: the server's certificate and key. The certificate's
+  subjectAltName covers `IP:140.226.4.75` and `IP:127.0.0.1`. `*.key` is gitignored, so never
+  commit or send it.
+
+The CA's private key (`ca.key`) lives only in `MS_FL_DEBUG/certs/`. See that repo's README for the
+`openssl` commands that regenerate the certificates.
+
+To check from Padova:
+
+```bash
+openssl s_client -connect 140.226.4.75:9092 -CAfile certs/ca.crt </dev/null | grep -E "Verify return|Protocol"
+```
+
+**Optional mutual TLS:** uncomment `tls-client-ca` in `pyproject.toml`, and have each client pass
+`--client-cert` / `--client-key`.
+
 ## Outputs
 
 Per trial, under `RESULTS_ROOT/<trial-tag>/`:
@@ -298,7 +326,10 @@ Per trial, under `RESULTS_ROOT/<trial-tag>/`:
 - `round_weights/` — only with `save-round-weights = true`: `round_000_server.pth` (the
   initial global model), then per round `round_NNN_client_<site>.pth` (each site's upload)
   and `round_NNN_server.pth` (their FedAvg). `(sites + 1) × rounds + 1` files, ~95 MB each
-  for resnet and ~1.2 GB each for retfound
+  for resnet and ~1.2 GB each for retfound. `save-round-weights-every = N` saves only every
+  Nth round plus the last. Each saved round also writes the previous round's
+  `round_NNN_server.pth`, so the trajectory plot can still draw that round's client
+  updates.
 
 TensorBoard scalars (global, per-site, and overlay comparisons) are written under `TB_ROOT/<trial-tag>/`.
 

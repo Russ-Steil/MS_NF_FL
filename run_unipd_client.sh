@@ -14,12 +14,16 @@
 # when the run finishes. Point it somewhere with room — a retfound checkpoint is
 # ~1.2 GB, and the default lands in runs/fl_clients/unipd/<trial>/ relative to
 # wherever the job was launched.
-FL_TOKEN=replace-me-unipd python fl_client.py \
+#
+# --ca-cert is the ca.crt from UCD (the same file as for MS_FL_DEBUG); it is how
+# this client knows it is talking to the real server over TLS.
+FL_TOKEN=b07ccfadd516825c604811dc161d4b73 python fl_client.py \
   --site unipd \
   --data-path /data/giacomo/Hereditary_MS/data/MS_cohort_non_MS_ctrls \
   --cache-path /data/giacomo/Hereditary_MS/noflower_FL/test_files/unipd_fake_cache \
-  --server http://140.226.4.75:9092 \
-  --trial-tag 20260918_retfound \
+  --server https://140.226.4.75:9092 \
+  --ca-cert certs/ca.crt \
+  --trial-tag nonretina_matched_10122026 \
   --weights-path /path/on/unipd/retfound_oct.safetensors \
   --save-path /path/on/unipd/20260918_retfound_final.pth \
   --gpu-index 0

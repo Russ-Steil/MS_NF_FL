@@ -50,33 +50,44 @@ round-timeout-s = 7200
 # 1.2 GB RETFound read off network storage can take minutes. Dropping a site
 # here aborts the entire run.
 heartbeat-timeout-s = 300
+# TLS is mandatory. Paths are relative to this file. The cert's subjectAltName
+# must include IP:140.226.4.75 and IP:127.0.0.1 — see README.md. Same certs
+# as MS_FL_DEBUG, so Padova uses one ca.crt for both.
+tls-cert = "certs/server.crt"
+tls-key = "certs/server.key"
+# Uncomment to require a client certificate from every site (mutual TLS)
+# tls-client-ca = "certs/ca.crt"
 
 [tool.fl.sites.ucd]
 display-name = "University of Denver"
-token = "replace-me-ucd"
+token = "158a6bef3ec90e23620d9d5bb3fd0a3f"
 
 [tool.fl.sites.unipd]
 display-name = "University of Padova"
-token = "replace-me-unipd"
+token = "b07ccfadd516825c604811dc161d4b73"
 
 [tool.fl.config]
-num-server-rounds = 30
+num-server-rounds = 300
 min-nodes = 2
 # lr / weight-decay apply to the resnet backbone (SGD + momentum)
 lr = 0.0005
 weight-decay = 0.0001
 local-epochs = 10
 batch-size = 16
-trial-tag = "trial7_1e5_10e_30r"
+trial-tag = "nonretina_matched_10122026"
 # true saves every client's upload and the aggregated server weights each round
 # to results/<trial-tag>/round_weights/ — (sites + 1) x rounds files, plus the
 # round 0 initial model. Large for retfound (~1.2 GB each). Plot them with
 # visualization/visualize_trajectory.py.
 save-round-weights = false
+# with save-round-weights on, save only every N rounds (plus the last round).
+# Each saved round also writes the previous round's global, which the
+# trajectory plot needs to place that round's client updates.
+save-round-weights-every = 1
 
 # "resnet" or "retfound". Set it in run_trial.sh; the server hands it to every
 # client at /join so all three build the same architecture.
-backbone = "resnet"
+backbone = "retfound"
 # The server's checkpoint seeds the whole federation, so this is required when
 # backbone = "retfound". Clients may pass their own copy via --weights-path,
 # which is checked against this one rather than used to initialise.

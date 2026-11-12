@@ -1,0 +1,3 @@
+- add images to tensorboard output
+- flip images and retrain classifier
+- non-optic nerve head cohort

@@ -6,9 +6,15 @@ The backbone (resnet or retfound) comes from the run-config and is handed to
 every client at /join along with the reference state_dict layout, so all three
 processes build the same model.
 
-Architecture: a single HTTP port. Clients pull the global weights, train
+Architecture: a single HTTPS port. Clients pull the global weights, train
 locally, and push weights plus scalar metrics back. Nothing inbound is needed
 at the client sites, which is what makes a SLURM compute node workable.
+
+Transport security: every connection is TLS (1.2 minimum), configured by
+tls-cert / tls-key in [tool.fl.server]; there is no plain-HTTP mode. Clients
+verify the server certificate against their --ca-cert. Setting tls-client-ca
+additionally requires a client certificate (mutual TLS). The bearer tokens
+stay on as a second factor.
 
 Design note (unchanged from the flwr version): the server never receives
 per-sample labels or probabilities. Each client reports only scalar summaries
@@ -40,6 +46,7 @@ import logging
 import os
 import platform
 import shlex
+import ssl
 import sys
 import threading
 import time
@@ -79,6 +86,8 @@ DEFAULT_ROUND_TIMEOUT_S = 7200.0
 DEFAULT_HEARTBEAT_TIMEOUT_S = 60.0
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 9092
+# a client that connects and never finishes the TLS handshake is dropped after this
+TLS_HANDSHAKE_TIMEOUT_S = 30.0
 # ----------------
 
 _LOGGER = logging.getLogger("ms_server")
@@ -574,17 +583,99 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": detail})
 
 
+# ---------------------------------------------------------------- tls
+
+def _config_path(value, base_dir):
+    """Relative paths in pyproject.toml resolve against the file's own directory."""
+    p = Path(str(value)).expanduser()
+    return p if p.is_absolute() else Path(base_dir) / p
+
+
+def build_tls_context(server_cfg, base_dir):
+    """
+    TLS for every request. There is deliberately no plain-HTTP fallback: the
+    bearer tokens and the full weights would otherwise cross the network in the
+    clear.
+
+    tls-cert / tls-key are the server's certificate and private key. The cert's
+    subjectAltName must cover the address the clients dial (IP:140.226.4.75, and
+    IP:127.0.0.1 for the local UCD client), or their hostname check fails.
+
+    tls-client-ca is optional. When set, every client must also present a
+    certificate signed by that CA (mutual TLS), on top of its bearer token.
+    """
+    cert = server_cfg.get("tls-cert")
+    key = server_cfg.get("tls-key")
+    if not cert or not key:
+        raise SystemExit(
+            "[tool.fl.server] needs tls-cert and tls-key — see 'TLS certificates' "
+            "in README.md"
+        )
+    cert, key = _config_path(cert, base_dir), _config_path(key, base_dir)
+    for label, p in (("tls-cert", cert), ("tls-key", key)):
+        if not p.is_file():
+            raise SystemExit(f"{label} does not exist: {p}")
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
+
+    client_ca = server_cfg.get("tls-client-ca")
+    if client_ca:
+        client_ca = _config_path(client_ca, base_dir)
+        if not client_ca.is_file():
+            raise SystemExit(f"tls-client-ca does not exist: {client_ca}")
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.load_verify_locations(cafile=str(client_ca))
+    return ctx, cert, client_ca
+
+
+class TLSHTTPServer(ThreadingHTTPServer):
+    """
+    ThreadingHTTPServer with TLS on every accepted connection.
+
+    The handshake is deferred to the per-request thread rather than done in
+    accept(): accept() runs on the single serve_forever thread, so a slow or
+    stalled client there would block every other site's heartbeat.
+    """
+
+    def __init__(self, server_address, handler, ssl_context):
+        super().__init__(server_address, handler)
+        self.ssl_context = ssl_context
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        return self.ssl_context.wrap_socket(
+            sock, server_side=True, do_handshake_on_connect=False
+        ), addr
+
+    def finish_request(self, request, client_address):
+        request.settimeout(TLS_HANDSHAKE_TIMEOUT_S)
+        try:
+            request.do_handshake()
+        except (ssl.SSLError, OSError) as exc:
+            # plain http://, a wrong CA at the client, a missing client cert
+            log(f"TLS handshake from {client_address[0]} failed: "
+                f"{type(exc).__name__}: {exc}")
+            return
+        request.settimeout(None)
+        super().finish_request(request, client_address)
+
+
 # ---------------------------------------------------------------- aggregator
 
 class Aggregator:
     """FedAvg plus timestamps, per-site metric tracking, TensorBoard, checkpointing."""
 
     def __init__(self, output_dir, tb_dir, run_config, expected_nodes, registry,
-                 save_round_weights=False):
+                 save_round_weights=False, save_every=1, num_rounds=None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # every client update plus the aggregate, every round
+        # every client update plus the aggregate, every save_every rounds and
+        # on the last round
+        self.save_every = max(1, int(save_every))
+        self.num_rounds = num_rounds
         self.round_weights_dir = None
         if save_round_weights:
             self.round_weights_dir = self.output_dir / "round_weights"
@@ -727,26 +818,43 @@ class Aggregator:
             (k, torch.as_tensor(np.array(v))) for k, v in agg.items()
         )
         torch.save(state_dict, self.output_dir / "model_federated_final.pth")
+        # the global model this round's clients started from
+        prev_state_dict = self._last_state_dict
         self._last_state_dict = state_dict
 
-        if self.round_weights_dir is not None:
-            self._save_round_weights(server_round, results, state_dict)
+        if self.round_weights_dir is not None and self._is_save_round(server_round):
+            self._save_round_weights(server_round, results, state_dict,
+                                     prev_state_dict)
 
         return agg
 
-    def _save_round_weights(self, server_round, results, server_state_dict):
+    def _is_save_round(self, server_round):
+        return (server_round % self.save_every == 0
+                or server_round == self.num_rounds)
+
+    def _save_round_weights(self, server_round, results, server_state_dict,
+                            prev_state_dict=None):
         """
         Client weights are each site's upload after local training in this
         round (started from the previous round's global); server weights are
         the FedAvg of those uploads. Same state_dict layout as the .pth
         checkpoints, so any of them loads with build_model() + load_state_dict.
+
+        When saving only every save_every rounds, the previous round's global
+        is written too: a client update is only placeable relative to the model
+        it started from, so visualize_trajectory.py needs round r-1 to draw the
+        round-r pulls and alignment.
         """
         d = self.round_weights_dir
+        prev = server_round - 1
+        if (prev_state_dict is not None and prev > 0
+                and not self._is_save_round(prev)):
+            torch.save(prev_state_dict, d / f"round_{prev:03d}_server.pth")
         for site, _n, params, _m in results:
             sd = OrderedDict((k, torch.as_tensor(np.array(v))) for k, v in params.items())
             torch.save(sd, d / f"round_{server_round:03d}_client_{site}.pth")
         torch.save(server_state_dict, d / f"round_{server_round:03d}_server.pth")
-        log(f"round {server_round} — saved {len(results)} client + 1 server "
+        log(f"round {server_round} — saved {len(results)} client + server "
             f"weights to {d}")
 
     def save_initial_weights(self, reference):
@@ -1054,6 +1162,9 @@ def main():
         )
 
     save_round_weights = as_bool(rc.get("save-round-weights", False), "save-round-weights")
+    save_every = int(rc.get("save-round-weights-every", 1))
+    if save_every < 1:
+        raise SystemExit("run-config 'save-round-weights-every' must be >= 1")
 
     retfound_weights = str(rc.get("retfound-weights", "")).strip()
     retfound_finetune = as_bool(rc.get("retfound-finetune", True), "retfound-finetune")
@@ -1092,6 +1203,11 @@ def main():
     port = int(args.port or server_cfg.get("port", DEFAULT_PORT))
     round_timeout = float(server_cfg.get("round-timeout-s", DEFAULT_ROUND_TIMEOUT_S))
     hb_timeout = float(server_cfg.get("heartbeat-timeout-s", DEFAULT_HEARTBEAT_TIMEOUT_S))
+    # before the model build, so a missing cert fails in seconds rather than
+    # after a 1.2 GB RETFound load
+    ssl_context, tls_cert, tls_client_ca = build_tls_context(
+        server_cfg, Path(args.pyproject).resolve().parent
+    )
 
     output_dir = RESULTS_ROOT / trial_tag
     tb_dir = TB_ROOT / trial_tag
@@ -1117,6 +1233,8 @@ def main():
     log(f"tensorboard -> {tb_dir}")
     log(f"round_timeout={round_timeout}s heartbeat_timeout={hb_timeout}s, "
         f"abort-on-first-failure enabled")
+    log(f"tls cert={tls_cert} mutual-tls="
+        f"{'on (client CA ' + str(tls_client_ca) + ')' if tls_client_ca else 'off'}")
 
     registry = SiteRegistry(sites_cfg, hb_timeout)
     for sid in registry.site_ids():
@@ -1144,21 +1262,30 @@ def main():
     del ref_model
 
     if save_round_weights:
-        # (sites + server) per round, plus the round 0 initial model
-        n_files = num_rounds * (len(registry.site_ids()) + 1) + 1
-        log(f"save-round-weights on: {n_files} files, ~{n_files * n_bytes / 1024**3:.1f} GB "
-            f"-> {output_dir / 'round_weights'}")
+        # per saved round: every site + the server, plus the previous round's
+        # server when it was not itself saved; plus the round 0 initial model
+        saved = [r for r in range(1, num_rounds + 1)
+                 if r % save_every == 0 or r == num_rounds]
+        n_files = 1 + sum(
+            len(registry.site_ids()) + 1
+            + (1 if r > 1 and not ((r - 1) % save_every == 0) else 0)
+            for r in saved
+        )
+        log(f"save-round-weights on, every {save_every} round(s) "
+            f"({len(saved)} rounds): {n_files} files, "
+            f"~{n_files * n_bytes / 1024**3:.1f} GB -> {output_dir / 'round_weights'}")
 
     run = Run(registry, reference, num_rounds, model_spec=model_spec)
     agg = Aggregator(output_dir, tb_dir, dict(rc), min_nodes, registry,
-                     save_round_weights=save_round_weights)
+                     save_round_weights=save_round_weights,
+                     save_every=save_every, num_rounds=num_rounds)
     agg.save_initial_weights(reference)
 
     Handler.RUN = run
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd = TLSHTTPServer((host, port), Handler, ssl_context)
     httpd.daemon_threads = True
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    event(f"federated server listening on {host}:{port}", CYAN)
+    event(f"federated server listening on https://{host}:{port}", CYAN)
 
     orch = Orchestrator(run, agg, registry, min_nodes, round_timeout)
 

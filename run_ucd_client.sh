@@ -7,11 +7,12 @@
 #
 # The final global weights are written to runs/fl_clients/ucd/<trial>/ when the
 # run finishes; pass --save-path to put them somewhere else.
-FL_TOKEN=replace-me-ucd python fl_client.py \
+FL_TOKEN=158a6bef3ec90e23620d9d5bb3fd0a3f python fl_client.py \
   --site ucd \
-  --data-path /data/giacomo/Hereditary_MS/data/MS_cohort_non_MS_ctrls \
-  --cache-path /data/giacomo/Hereditary_MS/data/MS_cohort_non_MS_ctrls/cache/ucd_512 \
-  --server http://127.0.0.1:9092 \
-  --trial-tag 20260930_retfound_lr001_weights_saved \
+  --data-path /data/russ/MS_NF_FL/symlinks/nonretina_ms_matched \
+  --cache-path /data/russ/MS_NF_FL/ucd_512_nonretina_matched_cache \
+  --server https://127.0.0.1:9092 \
+  --ca-cert certs/ca.crt \
+  --trial-tag nonretina_matched_10122026 \
   --weights-path /data/russ/weights/retfound_oct.safetensors \
   --gpu-index 0

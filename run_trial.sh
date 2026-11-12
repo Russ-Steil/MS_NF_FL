@@ -15,4 +15,5 @@ python run_server.py --run-config 'backbone=retfound
   batch-size=4
   local-epochs=10
   save-round-weights=true
-  trial-tag="20260930_retfound_lr001_weights_saved"'
+  save-round-weights-every=20
+  trial-tag="nonretina_matched_10122026"'

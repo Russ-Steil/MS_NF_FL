@@ -10,6 +10,11 @@ test_files/
 *.json
 *.log
 
+# TLS private keys — never commit. certs/ca.crt is public and may be committed.
+*.key
+*.srl
+certs/*.csr
+
 # cached caches
 *_cache/
 

@@ -4,7 +4,8 @@ Federated client for the MS classifier. No flwr.
 
 Pulls the global weights from the server, trains locally, pushes weights and
 scalar metrics back. Nothing inbound is needed here, so this runs unchanged on
-a SLURM compute node.
+a SLURM compute node. All traffic is HTTPS; the server's certificate is
+verified against --ca-cert.
 
 The architecture is not chosen here: the /join response names the backbone, the
 input resolution and the reference state_dict layout, and the client builds to
@@ -26,6 +27,7 @@ import gc
 import json
 import os
 import platform
+import ssl
 import sys
 import threading
 import time
@@ -62,6 +64,7 @@ POLL_INTERVAL_S = 5.0
 HTTP_TIMEOUT_S = 1800.0
 HTTP_RETRIES = 3
 HTTP_BACKOFF_S = 3.0
+DEFAULT_CA_CERT = Path(__file__).resolve().parent / "certs" / "ca.crt"
 
 
 def write_failure(dataset_name, trial_tag, phase, server_round, exc):
@@ -190,13 +193,38 @@ def get_dataloaders(dataset_name, data_path, batch_size=4, image_size=512,
 
 # ---------------------------------------------------------------- transport
 
-class Transport:
-    """Thin stdlib HTTP client. Retries transient network errors, not HTTP 4xx."""
+def build_ssl_context(ca_cert, client_cert=None, client_key=None):
+    """
+    Verifies the server against ca_cert, hostname check included — the server
+    certificate's subjectAltName must cover the address in --server.
+    client_cert/client_key are only needed when the server runs mutual TLS.
+    """
+    if not os.path.isfile(ca_cert):
+        raise FileNotFoundError(
+            f"CA certificate not found: {ca_cert} — get ca.crt from the server "
+            f"operator (see 'TLS certificates' in README.md)"
+        )
+    ctx = ssl.create_default_context(cafile=ca_cert)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    if client_cert:
+        ctx.load_cert_chain(certfile=client_cert, keyfile=client_key)
+    return ctx
 
-    def __init__(self, base_url, token, site):
+
+class Transport:
+    """Thin stdlib HTTPS client. Retries transient network errors, not HTTP 4xx
+    or certificate failures."""
+
+    def __init__(self, base_url, token, site, ssl_context):
         self.base = base_url.rstrip("/")
+        if not self.base.startswith("https://"):
+            raise ValueError(
+                f"--server must be an https:// URL, got {base_url!r}; the "
+                f"server only accepts TLS"
+            )
         self.token = token
         self.site = site
+        self.ssl_context = ssl_context
 
     def _request(self, method, path, body=None, meta=None, binary_response=False):
         url = f"{self.base}{path}"
@@ -210,7 +238,8 @@ class Transport:
         for attempt in range(1, HTTP_RETRIES + 1):
             req = Request(url, data=body, headers=headers, method=method)
             try:
-                with urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+                with urlopen(req, timeout=HTTP_TIMEOUT_S,
+                             context=self.ssl_context) as resp:
                     payload = resp.read()
                     if binary_response:
                         return payload
@@ -219,6 +248,15 @@ class Transport:
                 detail = e.read().decode("utf-8", "replace")
                 raise RuntimeError(f"{method} {path} -> HTTP {e.code}: {detail}")
             except (URLError, TimeoutError, ConnectionError, OSError) as e:
+                # a wrong CA or a cert that does not cover this address will not
+                # fix itself on retry
+                reason = getattr(e, "reason", e)
+                if isinstance(reason, ssl.SSLCertVerificationError):
+                    raise RuntimeError(
+                        f"{method} {path}: server certificate rejected: {reason}. "
+                        f"Check --ca-cert and that the server cert covers "
+                        f"{self.base}."
+                    )
                 last = e
                 if attempt < HTTP_RETRIES:
                     time.sleep(HTTP_BACKOFF_S * attempt)
@@ -636,9 +674,17 @@ def main():
     ap.add_argument("--data-path", required=True,
                     help="directory holding train/ and val/")
     ap.add_argument("--server", required=True,
-                    help="e.g. http://140.226.4.75:9092")
+                    help="e.g. https://140.226.4.75:9092")
     ap.add_argument("--token", default=os.environ.get("FL_TOKEN", ""),
                     help="site token; defaults to $FL_TOKEN")
+    ap.add_argument("--ca-cert", default=str(DEFAULT_CA_CERT),
+                    help="CA certificate the server's TLS certificate is checked "
+                         "against (default: certs/ca.crt in this repo)")
+    ap.add_argument("--client-cert", default=None,
+                    help="this site's TLS certificate; only needed when the "
+                         "server requires mutual TLS")
+    ap.add_argument("--client-key", default=None,
+                    help="private key for --client-cert")
     ap.add_argument("--cache-path", default=None,
                     help="directory of .pt tensors from cache_images.py; "
                          "falls back to decoding from --data-path when omitted")
@@ -667,7 +713,16 @@ def main():
           f"numpy={np.__version__} python={platform.python_version()} "
           f"host={platform.node()}", flush=True)
 
-    transport = Transport(args.server, args.token, dataset_name)
+    try:
+        ssl_context = build_ssl_context(args.ca_cert, args.client_cert,
+                                        args.client_key)
+        transport = Transport(args.server, args.token, dataset_name, ssl_context)
+    except (OSError, ValueError, ssl.SSLError) as e:
+        print(f"[client:{dataset_name}] TLS setup failed: {e}", file=sys.stderr)
+        sys.exit(2)
+    print(f"[client:{dataset_name}] TLS: verifying server against {args.ca_cert}"
+          + (f", client cert {args.client_cert}" if args.client_cert else ""),
+          flush=True)
     client = None
     hb = None
     phase, rnd = "startup", 0
